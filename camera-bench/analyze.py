@@ -6,7 +6,12 @@
 import argparse
 import csv
 import math
+import os
 import statistics as st
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from bench import jitter_rms, still_windows  # noqa: E402
 
 
 def pct(a, p):
@@ -20,7 +25,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("csv")
     ap.add_argument("--screen", default="1728x1117", help="screen size in points (from the I,camera line)")
-    ap.add_argument("--still", type=float, default=15, help="px/s below which the hand counts as still")
+    ap.add_argument("--still-px", type=float, default=15,
+                    help="a half-second window counts as still when the median-smoothed raw point stays within this")
     a = ap.parse_args()
     sw, sh = (int(v) for v in a.screen.split("x"))
 
@@ -48,33 +54,18 @@ def main():
         lag = [math.dist((float(r["raw_x"]), float(r["raw_y"])), (float(r["x"]), float(r["y"]))) for r in driven]
         print(f"1€ filter offset raw->filtered: p50 {pct(lag, .5):.1f} px, p95 {pct(lag, .95):.1f} px")
 
-        # stillness jitter: rms about the mean over runs of consecutive still frames >= 0.5 s
-        runs, cur = [], []
-        prev = None
-        for r in driven:
-            t, x, y = float(r["t_frame"]), float(r["x"]), float(r["y"])
-            if prev is not None:
-                speed = math.dist((x, y), prev[1:]) / max(t - prev[0], 1e-4)
-                if speed < a.still and t - prev[0] < 0.1:
-                    cur.append((t, x, y))
-                else:
-                    if len(cur) >= 15:
-                        runs.append(cur)
-                    cur = []
-            prev = (t, x, y)
-        if len(cur) >= 15:
-            runs.append(cur)
-        if runs:
-            js = []
-            for run in runs:
-                mx = sum(p[1] for p in run) / len(run)
-                my = sum(p[2] for p in run) / len(run)
-                js.append(math.sqrt(sum((p[1] - mx) ** 2 + (p[2] - my) ** 2 for p in run) / len(run)))
-            longest = max(runs, key=len)
-            print(f"still: {len(runs)} stretches, longest {longest[-1][0] - longest[0][0]:.1f} s, "
-                  f"jitter rms p50 {st.median(js):.2f} px, worst {max(js):.2f} px")
+        # stillness jitter: half-second windows in which the raw point rested (same rule as the S line)
+        inside = [r for r in driven if 0 < float(r["raw_x"]) < sw - 1 and 0 < float(r["raw_y"]) < sh - 1]
+        raw_pts = [(float(r["raw_x"]), float(r["raw_y"])) for r in inside]
+        out_pts = [(float(r["x"]), float(r["y"])) for r in inside]
+        wins = still_windows(raw_pts, still_px=a.still_px)
+        if wins:
+            js = [jitter_rms(out_pts[s:s + 15]) for s in wins]
+            raw_js = [jitter_rms(raw_pts[s:s + 15]) for s in wins]
+            print(f"still: {len(wins)} half-second windows at rest, jitter rms p50 {st.median(js):.2f} px "
+                  f"(raw {st.median(raw_js):.2f}), worst {max(js):.2f} px")
         else:
-            print("still: no stretch of 0.5 s or more with the hand still")
+            print("still: no half-second window with the hand at rest")
 
     # pinches (from the pinched column) and the pinch measure distribution
     key = "pinch_m" if "pinch_m" in rows[0] else "pinch_ratio"
@@ -111,6 +102,9 @@ def main():
     long = [(s, d) for s, d in gaps if d >= 0.2]
     print(f"drop-outs >= 0.2 s after first sight: {len(long)}" +
           (" (" + ", ".join(f"{s:.1f}s for {d:.1f}s" for s, d in long[:8]) + (", ..." if len(long) > 8 else "") + ")" if long else ""))
+    if "held" in rows[0]:
+        short = [g for g in gaps if g[1] < 0.2]
+        print(f"short losses coasted through (--hold-ms): {sum(1 for r in rows if r['held'] == '1')} frames in {len(short)} gaps")
 
 
 if __name__ == "__main__":

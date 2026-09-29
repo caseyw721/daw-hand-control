@@ -4,8 +4,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bench import (AbsoluteMap, Marker, OneEuro, Pinch, RelativeMap, pinch_dist, pinch_ratio, point_of,  # noqa: E402
-                   rect_from_sweep, INDEX_TIP, THUMB_TIP, WRIST, MIDDLE_MCP)
+from bench import (AbsoluteMap, Marker, OneEuro, Pinch, Presence, RelativeMap, jitter_rms, lead_gain,  # noqa: E402
+                   pinch_dist, pinch_ratio, point_of, rect_from_sweep, still_windows, INDEX_TIP, THUMB_TIP,
+                   WRIST, MIDDLE_MCP)
 
 fails = 0
 
@@ -42,6 +43,39 @@ for i in range(60):
         lag = i - 10
 check(lag is not None and lag <= 3, f"fast step is followed within 3 frames (got {lag})")
 
+# --- lead: exact for constant velocity, nothing at rest, gated by speed ---
+f = OneEuro(1.0, 0.02)
+for i in range(200):
+    f(1000.0 * i / 60, i / 60)   # 1000 px/s, long enough for the velocity estimate to settle
+check(abs(f.lead(0.04) - (f.x + 40.0)) < 0.5, f"40 ms lead at 1000 px/s is 40 px ahead ({f.lead(0.04) - f.x:.2f})")
+f = OneEuro(1.0, 0.02)
+for i in range(60):
+    f(100.0, i / 60)
+check(f.lead(0.04) == f.x, "no lead for a hand at rest")
+check(lead_gain(0) == 0 and lead_gain(150) == 0 and lead_gain(325) == 0.5 and lead_gain(500) == 1 and lead_gain(5000) == 1,
+      "lead gain ramps 0 -> 1 between 150 and 500 px/s")
+check(lead_gain(300, 100, 500) == 0.5, "lead gain takes a custom gate")
+
+# --- stillness: judged on the median-smoothed raw point over half-second windows ---
+random.seed(2)
+rest1 = [(500 + random.gauss(0, 5), 500 + random.gauss(0, 5)) for _ in range(15)]
+move = [(500 + 1000 / 30 * i, 500.0) for i in range(1, 16)]
+rest2 = [(1000 + random.gauss(0, 5), 500 + random.gauss(0, 5)) for _ in range(15)]
+check(still_windows(rest1 + move + rest2) == [0, 30], f"still windows are the two rests, not the move ({still_windows(rest1 + move + rest2)})")
+spiky = rest1[:7] + [(700.0, 700.0)] + rest1[8:]
+check(still_windows(spiky) == [0], "a one-frame landmark glitch does not break a rest (median)")
+check(jitter_rms([(1.0, 1.0)] * 15) == 0 and abs(jitter_rms([(0.0, 0.0), (2.0, 0.0)]) - 1.0) < 1e-9, "jitter rms about the mean")
+
+# --- presence: short losses coast, a long one is lost exactly once, hold 0 is the old behaviour ---
+pr = Presence(hold_s=0.17)
+seq = [(True, 0.0), (False, 0.033), (False, 0.066), (True, 0.1), (False, 0.133), (False, 0.2), (False, 0.3),
+       (False, 0.333), (True, 0.4)]
+states = [pr.update(h, t) for h, t in seq]
+check(states == ["tracked", "held", "held", "tracked", "held", "held", "lost", "gone", "tracked"], f"presence states {states}")
+check(Presence(0.17).update(False, 0.0) == "gone", "no hand before the first sighting is nothing to lose")
+pr = Presence(hold_s=0)
+check(pr.update(True, 0) == "tracked" and pr.update(False, 0.033) == "lost", "hold 0 loses the hand on the first missing frame")
+
 # --- pinch hysteresis ---
 p = Pinch(on=0.30, off=0.45, min_frames=2)
 seq = [0.8, 0.8, 0.25, 0.25, 0.35, 0.35, 0.5, 0.5, 0.8]
@@ -59,6 +93,11 @@ p = Pinch(on=0.035, off=0.055, min_frames=2, off_frames=3)
 seq = [0.09, 0.03, 0.03, 0.06, 0.06, 0.04, 0.06, 0.06, 0.06]
 events = [p.update(d) for d in seq]
 check(events == [None, None, "down", None, None, None, None, None, "up"], f"world pinch events {events}")
+p = Pinch(on=0.035, off=0.055, min_frames=2, off_frames=3)
+for d in (0.02, 0.02, 0.07, 0.07):  # pinched, then two of the three release frames counted
+    p.update(d)
+p.reset()
+check(not p.closed and p.update(0.02) is None, "reset forgets the half-counted frames: one frame cannot pinch")
 
 # --- pinch ratio and points ---
 lm = [(0.0, 0.0, 0.0)] * 21

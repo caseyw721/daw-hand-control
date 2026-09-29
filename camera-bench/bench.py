@@ -15,14 +15,20 @@ reported (P line, Tink sound) but never clicks unless --click is given.
     ./run.sh --no-cursor         # measure only, leave the cursor alone
     ./run.sh --log run.csv       # per-frame timings and positions
     ./run.sh --marker            # big black/white square follows the cursor (for slow-mo latency filming)
+    ./run.sh --hold-ms 180       # coast through hand losses shorter than this (MediaPipe flickers, mostly mid-pinch)
+    ./run.sh --lead-ms 40        # predict this far ahead while the hand moves (buys back latency, costs overshoot)
 
 Needs macOS Camera permission for the terminal (first run asks) and Accessibility
 permission to move the cursor. Ctrl-C stops it.
 
 Lines on stderr:
-    I,...                                  information (camera, screen, calibrated box)
+    I,...                                  information (camera, screen, calibrated box, warnings)
     P,<t s>,<down|up>,<pinch m>,<x>,<y>    pinch events (a Tink sound plays on "down")
-    S,<fps>,<detect ms p50>,<detect ms p95>,<loop ms p50>,<hand %>,<still>,<jitter px rms>,<pinch>   once a second
+    S,<fps>,<detect ms p50>,<detect ms p95>,<loop ms p50>,<hand %>,<still>,<jitter px rms>,<pinch>,<held gaps>,<lost>
+                                           once a second. "still" = the hand rested for a half-second window this
+                                           second (judged on the raw point, see still_windows), "jitter" = rms of the
+                                           shown point in those windows; "held gaps" = short losses coasted through,
+                                           "lost" = real ones
 """
 import argparse
 import collections
@@ -41,11 +47,14 @@ WRIST, THUMB_TIP, INDEX_MCP, INDEX_TIP, MIDDLE_MCP, RING_MCP, PINKY_MCP = 0, 4, 
 
 
 class OneEuro:
-    """1€ filter (Casiez et al. 2012). Units: whatever you feed it, per second."""
+    """1€ filter (Casiez et al. 2012). Units: whatever you feed it, per second. `dx` is the low-passed
+    derivative of the *raw* input, as in the paper: taking it against the previous filtered value
+    instead over-reads speed by lag/dt (a third too high at 1000 px/s here), which opened the cutoff
+    early and made lead() overshoot."""
 
     def __init__(self, mincutoff=1.0, beta=0.02, dcutoff=1.0):
         self.mincutoff, self.beta, self.dcutoff = mincutoff, beta, dcutoff
-        self.x = self.dx = None
+        self.x = self.dx = self.raw = None
         self.t = None
 
     @staticmethod
@@ -55,11 +64,12 @@ class OneEuro:
 
     def __call__(self, x, t):
         if self.x is None:
-            self.x, self.dx, self.t = x, 0.0, t
+            self.x, self.dx, self.raw, self.t = x, 0.0, x, t
             return x
         dt = max(t - self.t, 1e-4)
         self.t = t
-        dx = (x - self.x) / dt
+        dx = (x - self.raw) / dt
+        self.raw = x
         a_d = self._alpha(self.dcutoff, dt)
         self.dx = a_d * dx + (1 - a_d) * self.dx
         cutoff = self.mincutoff + self.beta * abs(self.dx)
@@ -67,8 +77,21 @@ class OneEuro:
         self.x = a * x + (1 - a) * self.x
         return self.x
 
+    def lead(self, seconds):
+        """Where the filtered value will be `seconds` from now if it keeps its filtered velocity:
+        a fixed-lead prediction that buys back that much of the pipeline's latency, paid for with
+        overshoot when the hand stops."""
+        return self.x + self.dx * seconds
+
     def reset(self):
-        self.x = self.dx = self.t = None
+        self.x = self.dx = self.raw = self.t = None
+
+
+def lead_gain(speed, v0=150.0, v1=500.0):
+    """How much of the lead to apply at this filtered speed (px/s): none at rest, all of it once the
+    hand is clearly moving, a ramp between. The filtered velocity of a still hand reaches ~95 px/s
+    (p99 in the recordings, 1€ 3 Hz / 0.05), and predicting from that only turns it into jitter."""
+    return min(max((speed - v0) / (v1 - v0), 0.0), 1.0)
 
 
 class Pinch:
@@ -95,6 +118,11 @@ class Pinch:
                 self.closed, self._run = False, 0
                 return "up"
         return None
+
+    def reset(self):
+        """Forget a pinch in progress *and* the half-counted frames: clearing only `closed` left a
+        release count behind, and one sub-threshold frame later could fire 'down' on its own."""
+        self.closed, self._run = False, 0
 
 
 def pinch_ratio(lm):
@@ -179,15 +207,38 @@ class RelativeMap:
         self.prev = None
 
 
+class Presence:
+    """Decides when a missing hand counts as gone. MediaPipe drops the hand for a frame or two
+    hundreds of times an hour, most often mid-pinch, and treating each of those as a departure
+    reset the filter and cancelled the pinch. For `hold_s` after the last sighting the tracker
+    coasts instead (filters, pinch, button and cursor keep their state); only when the hold
+    expires is the hand lost, once."""
+
+    def __init__(self, hold_s=0.18):
+        self.hold_s = hold_s
+        self.last_seen = None
+        self.gone = True  # nothing to lose before the first sighting, or after "lost" was reported
+
+    def update(self, hand, t):
+        """'tracked' | 'held' (short gap, coast) | 'lost' (once, when the hold expires) | 'gone'."""
+        if hand:
+            self.last_seen, self.gone = t, False
+            return "tracked"
+        if self.gone:
+            return "gone"
+        if t - self.last_seen <= self.hold_s:
+            return "held"
+        self.gone = True
+        return "lost"
+
+
 class Cursor:
     """Posts cursor moves and clicks with Quartz. Nothing else touches the cursor."""
 
     def __init__(self, enabled=True):
         self.enabled = enabled
         self.down = False
-        if enabled:
-            import Quartz  # noqa: F401  (fail early if the binding is missing)
-        self.Q = __import__("Quartz") if enabled else None
+        self.Q = __import__("Quartz") if enabled else None  # fails early if the binding is missing
 
     def screen(self):
         if not self.Q:
@@ -302,6 +353,50 @@ def percentile(a, p):
     return s[min(len(s) - 1, int(p * len(s)))]
 
 
+def median_smooth(pts, k=5):
+    """Per-axis running median of (x, y) points over k frames: the hand's path without the
+    landmark jitter, for deciding whether it is at rest."""
+    h = k // 2
+    out = []
+    for i in range(len(pts)):
+        xs = sorted(p[0] for p in pts[max(0, i - h):i + h + 1])
+        ys = sorted(p[1] for p in pts[max(0, i - h):i + h + 1])
+        out.append((xs[len(xs) // 2], ys[len(ys) // 2]))
+    return out
+
+
+def still_windows(raw, win=15, still_px=15.0):
+    """Start indices of the non-overlapping `win`-frame windows in which the median-smoothed raw
+    point stayed within `still_px` on both axes: the hand was at rest. Judging stillness on the
+    filtered point would depend on the filter being measured, and a speed threshold on the raw
+    point trips on its own jitter (5 px rms looks like 100-300 px/s at 30 fps)."""
+    sm = median_smooth(raw)
+    starts = []
+    for s in range(0, len(raw) - win + 1, win):
+        xs = [p[0] for p in sm[s:s + win]]
+        ys = [p[1] for p in sm[s:s + win]]
+        if max(xs) - min(xs) <= still_px and max(ys) - min(ys) <= still_px:
+            starts.append(s)
+    return starts
+
+
+def jitter_rms(pts):
+    """RMS distance of points from their mean."""
+    n = len(pts)
+    mx, my = sum(p[0] for p in pts) / n, sum(p[1] for p in pts) / n
+    return math.sqrt(sum((p[0] - mx) ** 2 + (p[1] - my) ** 2 for p in pts) / n)
+
+
+def parse_pair(s):
+    try:
+        lo, hi = (float(v) for v in s.split(","))
+    except ValueError:
+        raise argparse.ArgumentTypeError("expected lo,hi")
+    if not 0 <= lo < hi:
+        raise argparse.ArgumentTypeError("expected 0 <= lo < hi")
+    return (lo, hi)
+
+
 def parse_rect(s):
     try:
         x0, y0, x1, y1 = (float(v) for v in s.split(","))
@@ -319,19 +414,35 @@ def main():
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--fps", type=int, default=60, help="requested camera rate (the camera decides)")
+    ap.add_argument("--fps", type=int, default=30,
+                    help="camera rate to pin. The built-in camera does 15-30; asking for more makes it report 15 "
+                         "and lets a dim room drop it to 15 fps with 66 ms exposures")
     ap.add_argument("--box", type=float, default=0.6, help="abs: fraction of the frame (centred) that spans the screen")
     ap.add_argument("--rect", type=parse_rect, help="abs: x0,y0,x1,y1 of the raw frame that spans the screen (overrides --box)")
     ap.add_argument("--calibrate", type=float, default=0,
                     help="abs: for this many seconds after a hand first appears, sweep your comfortable range; "
                          "that range becomes the box (printed as I,rect,... for --rect next time)")
     ap.add_argument("--gain", type=float, default=2.5, help="rel: screen widths per frame width of motion")
-    ap.add_argument("--mincutoff", type=float, default=1.0, help="1€ filter: smoothing when still (Hz)")
-    ap.add_argument("--beta", type=float, default=0.02, help="1€ filter: how fast smoothing turns off (per px/s)")
+    ap.add_argument("--mincutoff", type=float, default=3.0,
+                    help="1€ filter: cutoff when still (Hz); its time constant 1/(2*pi*f) is the lag of a move from rest "
+                         "(53 ms at 3 Hz, 159 ms at the old 1 Hz). See tune_filter.py")
+    ap.add_argument("--beta", type=float, default=0.05,
+                    help="1€ filter: how fast the cutoff opens with speed (Hz per px/s); 0.05 halves the lag at "
+                         "speed against 0.02 for 0.7 px more jitter")
     ap.add_argument("--pinch-on", type=float, default=0.035, help="pinch closes below this thumb-index distance (m, world landmarks)")
     ap.add_argument("--pinch-off", type=float, default=0.055, help="pinch opens above this distance (m)")
     ap.add_argument("--heisenberg-ms", type=float, default=80, help="click where the cursor was this long before the pinch")
-    ap.add_argument("--still", type=float, default=15, help="speed (px/s) below which the hand counts as still")
+    ap.add_argument("--hold-ms", type=float, default=180,
+                    help="coast through a hand loss shorter than this (5 frames, measured from the last sighting): "
+                         "no filter reset, pinch and button keep their state. 0 = every missing frame is a loss")
+    ap.add_argument("--lead-ms", type=float, default=0,
+                    help="predict this far ahead along the filtered velocity while the hand moves (gated by speed, "
+                         "so a still hand is not made jittery); buys back latency, costs overshoot at stops")
+    ap.add_argument("--lead-gate", type=parse_pair, default=(150.0, 500.0), metavar="LO,HI",
+                    help="filtered speeds (px/s) between which the lead ramps from nothing to all of it")
+    ap.add_argument("--still-px", type=float, default=15,
+                    help="the hand counts as still for a half-second window when its median-smoothed raw point "
+                         "stays within this many px (the S line's still/jitter fields)")
     ap.add_argument("--presence", type=float, default=0.4, help="MediaPipe min hand presence confidence (lower = fewer drop-outs)")
     ap.add_argument("--tracking", type=float, default=0.4, help="MediaPipe min tracking confidence")
     ap.add_argument("--no-cursor", action="store_true", help="measure only; do not move the cursor")
@@ -360,6 +471,7 @@ def main():
     mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
     pinch = Pinch(on=args.pinch_on, off=args.pinch_off, min_frames=2, off_frames=3)
+    presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
     calibrating = args.mode == "abs" and args.calibrate > 0
     cal_pts, cal_until = [], None
@@ -367,14 +479,17 @@ def main():
     cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FPS, args.fps)  # (CAP_PROP_BUFFERSIZE is not supported by the AVFoundation backend)
     if not cap.isOpened():
         sys.exit("camera %d did not open (Camera permission for this terminal?)" % args.camera)
     cw, ch, cfps = cap.get(3), cap.get(4), cap.get(5)
     print(f"I,camera,{int(cw)}x{int(ch)},{cfps:.0f}fps,screen,{sw}x{sh},mode,{args.mode},point,{args.point},"
-          f"pinch,{args.pinch_on}/{args.pinch_off},presence,{args.presence},tracking,{args.tracking}",
+          f"pinch,{args.pinch_on}/{args.pinch_off},presence,{args.presence},tracking,{args.tracking},"
+          f"hold,{args.hold_ms:g}ms,lead,{args.lead_ms:g}ms,filter,{args.mincutoff:g}/{args.beta:g}",
           file=sys.stderr, flush=True)
+    if abs(cfps - args.fps) > 0.5:
+        print(f"I,warning,camera reports {cfps:.0f} fps after asking for {args.fps}; its floor is what a dim room "
+              f"will run at", file=sys.stderr, flush=True)
     if args.mode == "abs":
         print("I,rect,%.3f,%.3f,%.3f,%.3f" % mapper.rect, file=sys.stderr, flush=True)
 
@@ -388,11 +503,11 @@ def main():
     )
     landmarker = vision.HandLandmarker.create_from_options(opts)
 
-    log = None
-    if args.log:
-        log = csv.writer(open(args.log, "w", newline=""))
+    log_file = open(args.log, "w", newline="") if args.log else None
+    log = csv.writer(log_file) if log_file else None
+    if log:
         log.writerow(["t_frame", "detect_ms", "post_ms", "hand", "raw_x", "raw_y", "x", "y",
-                      "pinch_ratio", "pinch_m", "pinched"])
+                      "pinch_ratio", "pinch_m", "pinched", "held"])
 
     last_hand_frame, dumps = None, 0
     if args.dump:
@@ -401,9 +516,10 @@ def main():
     t0 = time.perf_counter()
     last_report = t0
     det_ms, loop_ms, frames, hands = [], [], 0, 0
-    still_pts = []
+    sec_raw, sec_pos = [], []  # this second's tracked points (raw and shown) for the stillness report
     last_pos = None
-    last_t = None
+    held_gaps = lost_n = 0
+    prev_state = "gone"
     try:
         while True:
             t_loop = time.perf_counter()
@@ -421,6 +537,10 @@ def main():
             det_ms.append((t_det - t_frame) * 1000)
 
             hand = bool(res.hand_landmarks)
+            state = presence.update(hand, t_det)
+            if hand and prev_state == "held":
+                held_gaps += 1
+            prev_state = state
             if args.dump and dumps < 30:
                 if hand:
                     last_hand_frame = frame
@@ -456,14 +576,16 @@ def main():
                 else:
                     raw = mapper(nx, ny)
                     pos = (fx(raw[0], t_det), fy(raw[1], t_det))
+                    if args.lead_ms:
+                        ahead = lead_gain(math.hypot(fx.dx, fy.dx), *args.lead_gate) * args.lead_ms / 1000
+                        pos = (fx.lead(ahead), fy.lead(ahead))
                     history.append((t_det, pos[0], pos[1]))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
-                    if last_pos is not None and last_t is not None:
-                        speed = math.dist(pos, last_pos) / max(t_det - last_t, 1e-4)
-                        if speed < args.still:
-                            still_pts.append(pos)
-                    last_pos, last_t = pos, t_det
+                    if 0 < raw[0] < sw - 1 and 0 < raw[1] < sh - 1:  # clamped at an edge is not "still"
+                        sec_raw.append(raw)
+                        sec_pos.append(pos)
+                    last_pos = pos
                     marker.move(*pos)
                     if event == "down":
                         # Heisenberg: the pinch itself nudges the finger; use the position from before it.
@@ -479,7 +601,10 @@ def main():
                             cursor.release(*pos)
                     else:
                         cursor.move(*pos)
-            else:
+            elif state == "held":
+                pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
+            elif state == "lost":
+                lost_n += 1
                 if isinstance(mapper, RelativeMap):
                     mapper.lost()
                 fx.reset(); fy.reset()
@@ -488,14 +613,14 @@ def main():
                     cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
                 if pinch.closed:
                     print(f"P,{t_det - t0:.2f},up,lost,0,0", file=sys.stderr, flush=True)
-                    pinch.closed = False
+                pinch.reset()
             t_post = time.perf_counter()
             loop_ms.append((t_post - t_loop) * 1000)
 
             if log:
                 log.writerow([f"{t_frame - t0:.4f}", f"{(t_det - t_frame) * 1000:.2f}", f"{(t_post - t_det) * 1000:.2f}",
                               int(hand), *(f"{v:.1f}" for v in (raw or (0, 0))), *(f"{v:.1f}" for v in (pos or (0, 0))),
-                              f"{ratio:.3f}", f"{dist:.4f}", int(pinch.closed)])
+                              f"{ratio:.3f}", f"{dist:.4f}", int(pinch.closed), int(state == "held")])
 
             if args.preview:
                 if hand:
@@ -516,17 +641,17 @@ def main():
             now = time.perf_counter()
             if now - last_report >= 1.0:
                 dt = now - last_report
-                if len(still_pts) >= 5:
-                    mx = sum(p[0] for p in still_pts) / len(still_pts)
-                    my = sum(p[1] for p in still_pts) / len(still_pts)
-                    jitter = math.sqrt(sum((p[0] - mx) ** 2 + (p[1] - my) ** 2 for p in still_pts) / len(still_pts))
+                wins = still_windows(sec_raw, still_px=args.still_px)
+                if wins:
+                    jitter = percentile([jitter_rms(sec_pos[s:s + 15]) for s in wins], .5)
                     still = 1
                 else:
                     jitter, still = 0.0, 0
                 print(f"S,{frames / dt:.1f},{percentile(det_ms, .5):.1f},{percentile(det_ms, .95):.1f},"
                       f"{percentile(loop_ms, .5):.1f},{100 * hands / max(frames, 1):.0f},{still},{jitter:.2f},"
-                      f"{int(pinch.closed)}", file=sys.stderr, flush=True)
-                det_ms, loop_ms, frames, hands, still_pts = [], [], 0, 0, []
+                      f"{int(pinch.closed)},{held_gaps},{lost_n}", file=sys.stderr, flush=True)
+                det_ms, loop_ms, frames, hands, sec_raw, sec_pos = [], [], 0, 0, [], []
+                held_gaps = lost_n = 0
                 last_report = now
             if args.seconds and now - t0 >= args.seconds:
                 break
@@ -536,6 +661,8 @@ def main():
         if cursor.down:
             cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
         cap.release()
+        if log_file:
+            log_file.close()
         if args.preview:
             cv2.destroyAllWindows()
 
