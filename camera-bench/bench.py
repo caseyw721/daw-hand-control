@@ -17,6 +17,7 @@ reported (P line, Tink sound) but never clicks unless --click is given.
     ./run.sh --marker            # big black/white square follows the cursor (for slow-mo latency filming)
     ./run.sh --hold-ms 180       # coast through hand losses shorter than this (MediaPipe flickers, mostly mid-pinch)
     ./run.sh --lead-ms 40        # predict this far ahead while the hand moves (buys back latency, costs overshoot)
+    ./run.sh --frames -          # every frame's landmarks as one JSON line on stdout, for the gesture engine (frames.py)
 
 Needs macOS Camera permission for the terminal (first run asks) and Accessibility
 permission to move the cursor. Ctrl-C stops it.
@@ -38,6 +39,8 @@ import os
 import subprocess
 import sys
 import time
+
+from frames import FrameWriter
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL = os.path.join(HERE, "models", "hand_landmarker.task")
@@ -456,6 +459,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = until Ctrl-C)")
     ap.add_argument("--log", help="CSV of every frame")
     ap.add_argument("--dump", help="directory: at each drop-out save the last frame with a hand and the first without")
+    ap.add_argument("--frames", metavar="PATH", help="write every frame's landmarks as one JSON line to PATH ('-' = stdout), for the gesture engine")
+    ap.add_argument("--hands", type=int, default=1, help="hands to track (2 for two-hand gestures; costs detect time)")
     ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
 
@@ -496,12 +501,13 @@ def main():
     opts = vision.HandLandmarkerOptions(
         base_options=mpt.BaseOptions(model_asset_path=args.model, delegate=mpt.BaseOptions.Delegate.CPU),
         running_mode=vision.RunningMode.VIDEO,
-        num_hands=1,
+        num_hands=args.hands,
         min_hand_detection_confidence=0.5,
         min_hand_presence_confidence=args.presence,
         min_tracking_confidence=args.tracking,
     )
     landmarker = vision.HandLandmarker.create_from_options(opts)
+    frames_out = FrameWriter(args.frames, cw, ch) if args.frames else None
 
     log_file = open(args.log, "w", newline="") if args.log else None
     log = csv.writer(log_file) if log_file else None
@@ -541,6 +547,8 @@ def main():
 
             hand = bool(res.hand_landmarks)
             state = presence.update(hand, t_det)
+            if frames_out:
+                frames_out.write(res, state, t_frame, t_det)
             if hand and prev_state == "held":
                 held_gaps += 1
             prev_state = state
@@ -668,6 +676,9 @@ def main():
         if cursor.down:
             cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
         cap.release()
+        if frames_out:
+            n, dropped = frames_out.close()
+            print(f"I,frames,{n},dropped,{dropped}", file=sys.stderr, flush=True)
         if log_file:
             log_file.close()
         if args.preview:
