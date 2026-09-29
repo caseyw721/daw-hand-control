@@ -4,7 +4,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bench import (AbsoluteMap, OneEuro, Pinch, RelativeMap, pinch_dist, pinch_ratio, point_of,  # noqa: E402
+from bench import (AbsoluteMap, Marker, OneEuro, Pinch, RelativeMap, pinch_dist, pinch_ratio, point_of,  # noqa: E402
                    rect_from_sweep, INDEX_TIP, THUMB_TIP, WRIST, MIDDLE_MCP)
 
 fails = 0
@@ -97,6 +97,10 @@ check(x > 500 and y == 250, f"relative motion moves the cursor the mirrored way 
 r.lost()
 x2, y2 = r(0.9, 0.9)  # reacquired somewhere else: no jump
 check((x2, y2) == (x, y), "reacquiring the hand after loss does not jump")
+
+# --- marker: a 160 px square centred on Quartz (top-left) point -> AppKit (bottom-left) origin ---
+check(Marker.origin(100, 50, 160, 1000) == (20, 870), "marker origin flips y and centres the square")
+check(Marker(enabled=False).win is None, "disabled marker creates no window")
 
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

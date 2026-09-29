@@ -14,6 +14,7 @@ reported (P line, Tink sound) but never clicks unless --click is given.
     ./run.sh --preview           # show the camera with landmarks and the box (costs a few ms)
     ./run.sh --no-cursor         # measure only, leave the cursor alone
     ./run.sh --log run.csv       # per-frame timings and positions
+    ./run.sh --marker            # big black/white square follows the cursor (for slow-mo latency filming)
 
 Needs macOS Camera permission for the terminal (first run asks) and Accessibility
 permission to move the cursor. Ctrl-C stops it.
@@ -231,6 +232,69 @@ class Sound:
             subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+class Marker:
+    """A large black square with a thick white border that follows the pointer, in a borderless,
+    click-through window above everything else. For filming latency in slow motion: the frame in
+    which the square first moves is unambiguous, where the small cursor is not. It follows the
+    computed position even with --no-cursor, so the real cursor can be left alone."""
+
+    def __init__(self, size=160, enabled=True):
+        self.size, self.enabled = size, enabled
+        self.win = None
+        if not enabled:
+            return
+        import AppKit
+        import Quartz
+        from Foundation import NSMakeRect
+        self.AK, self.Q = AppKit, Quartz
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)  # no Dock icon
+        # AppKit's origin is the bottom-left of the primary display; Quartz's is the top-left.
+        self.sh = int(AppKit.NSScreen.screens()[0].frame().size.height)
+        win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, size, size), AppKit.NSWindowStyleMaskBorderless,
+            AppKit.NSBackingStoreBuffered, False)
+        win.setLevel_(AppKit.NSScreenSaverWindowLevel)
+        win.setOpaque_(False)
+        win.setBackgroundColor_(AppKit.NSColor.clearColor())
+        win.setIgnoresMouseEvents_(True)  # clicks go through to whatever is underneath
+        win.setHasShadow_(False)
+        win.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                                   | AppKit.NSWindowCollectionBehaviorStationary)
+        view = win.contentView()
+        view.setWantsLayer_(True)
+        layer = view.layer()
+        layer.setBackgroundColor_(AppKit.NSColor.blackColor().CGColor())
+        layer.setBorderColor_(AppKit.NSColor.whiteColor().CGColor())
+        layer.setBorderWidth_(size / 8)
+        win.orderFrontRegardless()
+        self.win = win
+        self.move(self.sh / 2, self.sh / 2)
+        Quartz.CATransaction.flush()
+        self.pump()
+
+    @staticmethod
+    def origin(x, y, size, screen_h):
+        """Window origin (AppKit, bottom-left) that centres a `size` square on Quartz point (x, y)."""
+        return x - size / 2, screen_h - y - size / 2
+
+    def pump(self):
+        """Drain pending AppKit events so the window keeps up without a run loop of its own."""
+        app = self.AK.NSApp
+        while True:
+            ev = app.nextEventMatchingMask_untilDate_inMode_dequeue_(
+                self.AK.NSEventMaskAny, None, self.AK.NSDefaultRunLoopMode, True)
+            if ev is None:
+                break
+            app.sendEvent_(ev)
+
+    def move(self, x, y):
+        if not self.win:
+            return
+        self.win.setFrameOrigin_(self.origin(x, y, self.size, self.sh))
+        self.pump()
+
+
 def percentile(a, p):
     if not a:
         return 0.0
@@ -275,6 +339,9 @@ def main():
                     help="make a pinch press and release the mouse button (default: pinch is a gesture only)")
     ap.add_argument("--quiet", action="store_true", help="no sounds on pinch / calibration")
     ap.add_argument("--preview", action="store_true")
+    ap.add_argument("--marker", type=int, nargs="?", const=160, metavar="PX",
+                    help="show a big black/white square (default 160 px) that follows the pointer, "
+                         "for filming latency in slow motion; works with --no-cursor too")
     ap.add_argument("--seconds", type=float, default=0, help="stop after this long (0 = until Ctrl-C)")
     ap.add_argument("--log", help="CSV of every frame")
     ap.add_argument("--dump", help="directory: at each drop-out save the last frame with a hand and the first without")
@@ -288,6 +355,7 @@ def main():
 
     cursor = Cursor(enabled=not args.no_cursor)
     sound = Sound(enabled=not args.quiet)
+    marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
     sw, sh = cursor.screen()
     mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
@@ -396,6 +464,7 @@ def main():
                         if speed < args.still:
                             still_pts.append(pos)
                     last_pos, last_t = pos, t_det
+                    marker.move(*pos)
                     if event == "down":
                         # Heisenberg: the pinch itself nudges the finger; use the position from before it.
                         tb = t_det - args.heisenberg_ms / 1000

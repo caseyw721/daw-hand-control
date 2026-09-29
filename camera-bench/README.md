@@ -38,6 +38,7 @@ Useful options (`run.sh --help` lists them all):
 | `--no-cursor` | Measure only |
 | `--preview` | Show the camera, landmarks, the box and pinch state (adds a few ms; off for measurements) |
 | `--log run.csv` | Per-frame timings, positions and both pinch measures |
+| `--marker [PX]` | A big black square with a white border (160 px by default) follows the pointer in a click-through window above everything, so a slow-motion video shows unambiguously which frame the pointer first moved in. Works with `--no-cursor` |
 
 Lines on stderr: `I,...` information (camera, screen, box), `P,<t>,<down|up>,<pinch m>,<x>,<y>` on
 each pinch, and once a second
@@ -74,3 +75,17 @@ controller/camera-bench/.venv/bin/python controller/camera-bench/tests/test_benc
   unavailable`) even with the CPU delegate, so the bench pins 0.10.21 with OpenCV 4 and
   numpy 1.x. `pip check` prints "not supported on this platform" for that wheel; it runs fine.
 - In absolute mode the cursor jumps to wherever the hand reappears. In relative mode it stays.
+
+## Measuring latency (motion-to-photon)
+
+`--log` only sees the time from a frame arriving to the cursor event being posted (detect + filter +
+dispatch). The camera's exposure and delivery, macOS's capture pipeline and the display's own lag
+are outside the process and usually dominate, so the real number needs an external clock:
+
+1. `run.sh --marker`, and film hand and screen together at 240 fps (iPhone slow-mo).
+2. Make one sharp, small flick of the finger, then hold still. Repeat about ten times.
+3. Scrub: count frames from the finger's first movement to the square's first movement.
+   At 240 fps each frame is 4.17 ms. Report the median and the spread.
+4. Same filming, same flick with the ring (a 1000 Hz USB mouse) gives the fair comparison.
+
+Keep the 1€ settings fixed between runs: a heavier filter adds lag that is not the camera's.
