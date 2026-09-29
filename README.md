@@ -4,7 +4,9 @@ Hand input for the DAW Control layer (Logic Pro + UAD Console). Two candidate po
 compared on the same tests:
 
 - `camera-bench/` — MediaPipe Hand Landmarker on the Mac's built-in camera → cursor.
-  Pinch is a gesture, never a click unless `--click`. See its README.
+  Pinch is a gesture, never a click unless `--click`. Its README has the measured latency
+  budget (the built-in camera alone costs ~90 ms), the drop-out anatomy, and the filter
+  tuning from the recordings in `camera-bench/recordings/`.
 - Fingertip IMU ring — firmware and receiver live in the ring repo (caseyw721/new-project, ~/ring).
 
 Both are measured with the ring repo's test app (`controller/test-app`, tests A–D), which
