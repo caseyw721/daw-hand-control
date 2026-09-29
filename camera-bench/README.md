@@ -89,3 +89,22 @@ are outside the process and usually dominate, so the real number needs an extern
 4. Same filming, same flick with the ring (a 1000 Hz USB mouse) gives the fair comparison.
 
 Keep the 1€ settings fixed between runs: a heavier filter adds lag that is not the camera's.
+
+### Measured 2026-09-29 (MacBook Pro M4 Pro, built-in camera, defaults: abs, tip, 1€ mincutoff 1 / beta 0.02)
+
+Phone clip at 120 fps (stored at 30 fps, so 8.4 ms of real time per video frame), hand and screen in
+one shot, `--marker` on. The square steps every 4 video frames, which confirms the 30 fps camera
+rate and the time stretch. Palm centre (MediaPipe on the clip) cross-correlated with the square's
+position:
+
+| Axis | Peak lag | Range where correlation is within 0.02 of peak |
+|---|---|---|
+| y | 101 ms | 70–140 ms |
+| x | 152 ms | 110–190 ms |
+
+Motion-to-photon is therefore **roughly 100–150 ms**, of which the process itself is only ~12 ms
+(detect 11 ms p50, dispatch 0.4 ms) plus the 33 ms frame interval. The rest is camera exposure and
+delivery, the 1€ filter (at mincutoff 1 Hz its slow-motion time constant is ~160 ms, so it is a
+large share at the speeds in this clip) and the display. The clip had no clean stop-then-flick
+events, so per-flick frame counting was not possible; a stiller hand between flicks would sharpen
+this to a few ms. Same run: hand lost 372 times in 8 min, 80 of them while pinched.
