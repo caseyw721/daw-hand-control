@@ -88,8 +88,11 @@ camera-bench/.venv/bin/python camera-bench/tests/test_bench.py
 - In absolute mode the cursor jumps to wherever the hand reappears. In relative mode it stays.
 - **Keep `--fps 30`.** The camera's formats allow 15–30 fps. Asking for 60 leaves the maximum
   frame duration at 1/15 s, and in a dim room auto-exposure takes it: one probe run went to
-  15 fps with 66 ms exposures. Pinned at 30 the camera raises gain instead. The bench prints an
-  `I,warning` if the camera reports anything but the pinned rate.
+  15 fps with 66 ms exposures. Pinned at 30 the camera raises gain instead. The pin is applied
+  again once frames flow (set only before the session runs, it did not always stick), and the
+  bench prints an `I,warning` if the *measured* rate over a second falls 3 fps or more below it.
+  OpenCV's own read-back of the rate right after opening is unreliable (15 on one run, 30 on the
+  next, both delivering 30), so the `I,camera` line labels it `reported`.
 - **Light the hand.** In this room the camera sits at ISO ~2100 with the exposure at the full
   33 ms frame period, so every frame is motion-blurred over 33 ms and MediaPipe's landmarks
   smear during fast moves. A desk lamp on the hand brings the exposure down to a few ms:

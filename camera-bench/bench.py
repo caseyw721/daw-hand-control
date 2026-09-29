@@ -483,13 +483,13 @@ def main():
     if not cap.isOpened():
         sys.exit("camera %d did not open (Camera permission for this terminal?)" % args.camera)
     cw, ch, cfps = cap.get(3), cap.get(4), cap.get(5)
-    print(f"I,camera,{int(cw)}x{int(ch)},{cfps:.0f}fps,screen,{sw}x{sh},mode,{args.mode},point,{args.point},"
+    # OpenCV's rate read-back right after opening is unreliable (15 on one run, 30 on the next, both
+    # delivering 30), so it is only labelled; the measured rate is what the S line and the warning use.
+    print(f"I,camera,{int(cw)}x{int(ch)},{cfps:.0f}fps-reported,screen,{sw}x{sh},mode,{args.mode},point,{args.point},"
           f"pinch,{args.pinch_on}/{args.pinch_off},presence,{args.presence},tracking,{args.tracking},"
           f"hold,{args.hold_ms:g}ms,lead,{args.lead_ms:g}ms,filter,{args.mincutoff:g}/{args.beta:g}",
           file=sys.stderr, flush=True)
-    if abs(cfps - args.fps) > 0.5:
-        print(f"I,warning,camera reports {cfps:.0f} fps after asking for {args.fps}; its floor is what a dim room "
-              f"will run at", file=sys.stderr, flush=True)
+    pinned = rate_warned = False  # the rate is pinned again once frames flow: set before the session runs, it did not always stick
     if args.mode == "abs":
         print("I,rect,%.3f,%.3f,%.3f,%.3f" % mapper.rect, file=sys.stderr, flush=True)
 
@@ -529,6 +529,9 @@ def main():
                 print("I,camera read failed", file=sys.stderr, flush=True)
                 time.sleep(0.01)
                 continue
+            if not pinned:
+                cap.set(cv2.CAP_PROP_FPS, args.fps)
+                pinned = True
             frames += 1
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
@@ -641,6 +644,10 @@ def main():
             now = time.perf_counter()
             if now - last_report >= 1.0:
                 dt = now - last_report
+                if not rate_warned and now - t0 > 2 and frames / dt < args.fps - 3:
+                    print(f"I,warning,camera delivering {frames / dt:.0f} fps against the {args.fps} pinned: a dim room "
+                          f"has stretched the exposure; add light", file=sys.stderr, flush=True)
+                    rate_warned = True
                 wins = still_windows(sec_raw, still_px=args.still_px)
                 if wins:
                     jitter = percentile([jitter_rms(sec_pos[s:s + 15]) for s in wins], .5)
