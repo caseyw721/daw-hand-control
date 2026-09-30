@@ -445,8 +445,12 @@ class AXProbe:
         return role, frame, name, False
 
     def _knob(self, el, frame):
-        """A slider's own thumb when it has one: Logic's volume fader is a 20x180 track with a 22x46 'fader knob'
-        inside (surveyed live), and grabbing or snapping to the track's middle misses the knob."""
+        """A long slider's own thumb when it has one: Logic's volume fader is a 20x180 track with a 22x46 'fader knob'
+        inside (surveyed live), and grabbing or snapping to the track's middle misses the knob. A square slider (a
+        knob) keeps its own frame: the track header's pan knob reports a 33 px value box offset from the 25 px knob,
+        and a press aimed there landed on the track header and dragged the whole track (user, live)."""
+        if frame is None or max(frame[2], frame[3]) < 2 * min(frame[2], frame[3]):
+            return frame
         for k in self._attr(el, "AXChildren") or []:
             if str(self._attr(k, "AXRole") or "") == "AXValueIndicator":
                 f = self._frame(k)
@@ -522,6 +526,20 @@ class AXProbe:
                 self.found = (time.monotonic(), role, frame, name, is_control)
             except Exception:
                 self.found = (time.monotonic(), None, None, "", False)
+
+    def verify(self, pos):
+        """Right before a grab presses: is the element at exactly this point a slider or knob (or part of one)? One
+        Accessibility lookup (~5-30 ms), so a press can never land on a track header or a region by mistake."""
+        if not self.ok:
+            return True, "no Accessibility"
+        try:
+            err, el = self.AS.AXUIElementCopyElementAtPosition(self.sys, pos[0], pos[1], None)
+            if err != 0 or el is None:
+                return False, "nothing"
+            role, frame, name, is_control = self.classify(el)
+            return (is_control and role in DRAG_ROLES), f"{role} {name[:24]}".strip()
+        except Exception as e:
+            return False, f"lookup failed ({e})"
 
     def control_at(self, pos):
         """The frame of the control under or within `zone` px of pos, if Accessibility saw one there recently."""
@@ -1475,8 +1493,13 @@ def main():
                         if held and grab.at is not None:
                             a = grab.step(t_det, free)
                             if a and a[0] == "press":
-                                cursor.press(a[1], a[2])
-                                print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f}", file=sys.stderr, flush=True)
+                                ok_here, what = probe.verify((a[1], a[2])) if (probe and grab.mode == "drag") else (True, "")
+                                if ok_here:
+                                    cursor.press(a[1], a[2])
+                                    print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f},{what}", file=sys.stderr, flush=True)
+                                else:
+                                    grab.reset()            # never press on something that is not the control
+                                    print(f"I,grab,refused,{a[1]:.0f},{a[2]:.0f},{what}", file=sys.stderr, flush=True)
                             elif a and a[0] == "drag":
                                 cursor.drag(a[1], a[2], a[3], a[4])
                         elif grab.at is not None and not held:

@@ -375,6 +375,13 @@ check(z.update((440.0, 409.0), t, 10.0, target=None) == (440.0, 409.0), "leaving
 tall = Lock(dwell=0.2, still=120, breakout=15, zone=40)
 out = tall.update((230.0, 950.0), 0.0, 10.0, held=True, grab_at=(230.0, 950.0), target=(197, 901, 20, 180))
 check(out == (216.0, 950.0), f"a grab next to a tall fader track presses on the track, not beside it ({out})")
+# --- a square slider (a knob) is pressed at its own centre; only long sliders aim at their thumb ---
+from bench import AXProbe  # noqa: E402
+bare = AXProbe.__new__(AXProbe)
+bare.ok = False
+check(bare._knob(None, (728, 382, 25, 25)) == (728, 382, 25, 25),
+      "a knob keeps its own frame (its offset value box put a press on the track header, live)")
+check(bare.verify((10, 10)) == (True, "no Accessibility"), "without Accessibility the press check cannot refuse")
 # --- a closed hand ---
 flat = [(0.0, 0.0, 0.0)] * 21
 straight = list(flat)
