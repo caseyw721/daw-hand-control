@@ -466,21 +466,21 @@ def aim_at(m, eye, target, tip_z, ipd=IPD_M, frames=60):
 
 
 check(eye_centres([(0.6, 0.4, 0.0)] * 478)[0][0] == 0.6, "eye centres are the middles of their corners")
-m = AimMap(SW, SH, MM)
+m = AimMap(SW, SH, MM, through="tip")
 eye = (0.02, -0.04, 0.55)
 for target in ((0.0, 0.05), (-0.12, 0.02), (0.14, 0.19)):
     got = aim_at(m, eye, target, 0.3)
     want = (target[0] * SW / 0.345 + SW / 2, target[1] * SH / 0.223)
     check(m.hit is not None and close(m.hit, target, 1e-3), f"the ray hits the aimed spot {target} ({m.hit})")
     check(got is not None and close(got, want, 1.0), f"the hit becomes the right screen point ({got} vs {want})")
-check(aim_at(AimMap(SW, SH, MM), eye, (0.0, 0.1), 0.52) is None, "no aim while the fingertip is at the eye")
-m = AimMap(SW, SH, MM)
+check(aim_at(AimMap(SW, SH, MM, through="tip"), eye, (0.0, 0.1), 0.52) is None, "no aim while the fingertip is at the eye")
+m = AimMap(SW, SH, MM, through="tip")
 check(m(scene(eye, (0, 0.1), 0.3)[1], HAND, CW, CH) is None, "no aim before the face has been seen")
-m = AimMap(SW, SH, MM)
+m = AimMap(SW, SH, MM, through="tip")
 aim_at(m, eye, (0.0, 0.1), 0.3)
 m.see_face(None, CW, CH, 3.0)
 check(m(scene(eye, (0.05, 0.1), 0.3)[1], HAND, CW, CH) is not None, "a face out of view keeps the last eye")
-m = AimMap(SW, SH, MM)
+m = AimMap(SW, SH, MM, through="tip")
 aim_at(m, eye, (0.05, 0.08), 0.3)
 m.recenter_next = True
 check(close(aim_at(m, eye, (0.05, 0.08), 0.3, frames=1), (SW / 2, SH / 2), 1.0), "recenter: where you aim becomes the centre")
@@ -489,7 +489,7 @@ check(close(aim_at(m, eye, (0.05, 0.08), 0.3, frames=1), (SW / 2, SH / 2), 1.0),
 def run_calibration(ipd, eye_at, noise=0.0, seed=3):
     """Calibrate a simulated user (eyes `ipd` apart) by pointing at the five dots, 30 frames each after settling."""
     random.seed(seed)
-    m, cal, t = AimMap(SW, SH, MM), AimCalibration(SW, SH), 0.0
+    m, cal, t = AimMap(SW, SH, MM, through="tip"), AimCalibration(SW, SH), 0.0
     for (fx_, fy_) in AIM_DOTS:
         target = ((fx_ * SW - SW / 2) * 0.345 / SW, fy_ * SH * 0.223 / SH)
         face, img, world = scene(eye_at, target, 0.3, ipd)
@@ -517,7 +517,7 @@ def miss_after(m, ipd, eye_at):
 small_eyes = 0.057                                   # 6 mm under the assumed spacing
 m, cal = run_calibration(small_eyes, eye)
 check(cal.done and len(cal.got) == 5 and cal.skipped == 0, f"a steady user captures all five dots ({len(cal.got)}, {cal.skipped} skipped)")
-before = miss_after(AimMap(SW, SH, MM), small_eyes, eye)
+before = miss_after(AimMap(SW, SH, MM, through="tip"), small_eyes, eye)
 fit, why = cal.fit(m.physical)
 check(fit is not None, f"the calibration fits ({why})")
 m.map = fit["map"]
@@ -545,10 +545,43 @@ cal = AimCalibration(SW, SH, timeout=3.0)
 events = [cal.feed(k / 30, (0.2 * math.sin(k / 3), 0.0)) for k in range(100)]   # waving 20 cm
 check("captured" not in events and events.count("skipped") == 1, f"a waving hand is never captured; the dot is skipped")
 check(cal.i == 1 and cal.progress == 0.0, "after a skip the next dot is up")
+cal = AimCalibration(SW, SH, timeout=3.0)
+events = [cal.feed(k / 30, None) for k in range(300)]                       # ten seconds with no face or hand
+check("skipped" not in events and cal.i == 0, "a dot waits while there is no aim to capture")
+events = [cal.feed(10 + k / 30, (0.0, 0.0)) for k in range(60)]
+check("captured" in events, "and is captured once the aim comes back")
 cal = AimCalibration(SW, SH)
 cal.got = [((0, 0), (0, 0)), ((100, 0), (0.001, 0.0)), ((0, 100), (0.0, 0.001))]
 fit, why = cal.fit((5000, 864, 5000, 0))
 check(fit is None and "scale" in why, f"a scale far from the display's is refused ({why})")
+
+# through the hand's base: the ray misses the target by the fixed tip-to-base offset, which calibration absorbs
+def run_calibration_through(through, ipd, eye_at):
+    m, cal, t = AimMap(SW, SH, MM, through=through), AimCalibration(SW, SH), 0.0
+    for (fx_, fy_) in AIM_DOTS:
+        face, img, world = scene(eye_at, ((fx_ - 0.5) * 0.345, fy_ * 0.223), 0.3, ipd)
+        for i in range(90):
+            t += 1 / 30
+            m.see_face(face, CW, CH, t)
+            m(img, world, CW, CH)
+            if cal.feed(t, m.hit) == "captured":
+                break
+    return m, cal
+
+
+m, cal = run_calibration_through("base", IPD_M, eye)
+fit, why = cal.fit(m.physical)
+check(fit is not None, f"calibrating through the hand's base fits ({why})")
+m.map = fit["map"]
+worst = miss_after(m, IPD_M, eye)
+check(worst < 40, f"through the base, the calibration absorbs the tip-to-base offset (worst miss {worst:.0f} pt)")
+check(AimMap(SW, SH, MM).through == (6,), "the ray runs through the index finger's middle joint by default")
+cal = AimCalibration(SW, SH, timeout=5.0)
+events = [cal.feed(k / 30, (0.0, 0.0)) for k in range(60)]                   # the centre dot, captured
+events = [cal.feed(2 + k / 30, (0.005, 0.0)) for k in range(90)]             # the hand stays where it was
+check("captured" not in events and len(cal.got) == 1, "a hand that has not moved on is not captured for the next dot")
+events = [cal.feed(5 + k / 30, (-0.06, -0.03)) for k in range(60)]
+check("captured" in events, "it is once the aim has moved to the new dot")
 
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)
