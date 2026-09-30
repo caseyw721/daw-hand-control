@@ -655,5 +655,21 @@ hh2 = [(t, 0.045 - (0.001 * k if k >= 20 else 0), 0.95) for k, (t, _, _) in enum
 check(rewind_point(hist, hh2, 29 / 30)[0] <= 560, f"with the thumb resting close, the most-open moment is used ({rewind_point(hist, hh2, 29 / 30)})")
 check(rewind_point([], [], 1.0) is None, "nothing to go back to")
 
+# --- the finger gun's trigger: arm with the thumb up, press by dropping it; a resting thumb never presses ---
+from bench import ThumbTrigger  # noqa: E402
+tr = ThumbTrigger()
+evs = [tr.update(0.008, k / 30) for k in range(60)]          # the thumb resting against the hand for 2 s
+check("down" not in evs and not tr.closed, "a thumb resting down never presses")
+evs = [tr.update(0.045, 2 + k / 30) for k in range(10)]      # raised 0.33 s: armed
+evs += [tr.update(0.008, 2.4 + k / 30) for k in range(5)]    # dropped: press
+check(evs.count("down") == 1 and tr.closed, "raise, then drop the thumb: one press")
+evs = [tr.update(0.02, 3 + k / 30) for k in range(10)]       # wobbling between the thresholds: still pressed
+check(tr.closed and "up" not in evs, "a thumb wobbling between the thresholds keeps the press")
+evs = [tr.update(0.045, 4 + k / 30) for k in range(5)]
+check(evs.count("up") == 1 and not tr.closed, "raising the thumb lets go")
+tr = ThumbTrigger()
+evs = [tr.update(0.045, k / 30) for k in range(3)] + [tr.update(0.008, 0.1 + k / 30) for k in range(5)]
+check("down" not in evs, "a thumb up for less than 0.2 s does not arm")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

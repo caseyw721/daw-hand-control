@@ -212,7 +212,7 @@ class Nudge:
 REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
 
 
-def rewind_point(history, hand_hist, t, grip=False, span=REWIND_S, noise=None):
+def rewind_point(history, hand_hist, t, what="pinch", span=REWIND_S, noise=None):
     """Where the cursor was just before a pinch (or, with `grip`, a closing hand) began, for the grab and the click.
     In aim mode the ray runs through the fingertip, and closing the fingers moves it: over the 0.4 s before a pinch
     closed the aim moved 229 px (median) and 957 px (p90) in the first nudge session (user, live: "I can't grab
@@ -220,13 +220,15 @@ def rewind_point(history, hand_hist, t, grip=False, span=REWIND_S, noise=None):
     (the user's thumb rests ~6 cm from the tip and pinches close slowly), so instead of predicting it the tracker
     looks back from the close to where the closing began: the peak of the thumb-to-index distance (or of the hand's
     openness) within `span` s, walking back until the value falls again by more than `noise`. history: (t, x, y);
-    hand_hist: (t, pinch m, openness). None when there is nothing to go back to."""
-    noise = noise if noise is not None else (0.03 if grip else 0.004)
+    hand_hist: (t, pinch m, openness[, thumb press m]); `what`: pinch, grip or thumb (the thumb trigger). None when
+    there is nothing to go back to."""
+    noise = noise if noise is not None else (0.03 if what == "grip" else 0.004)
     when, most = None, -1.0
-    for (th, dist, opened) in reversed(hand_hist):
+    for row in reversed(hand_hist):
+        th = row[0]
         if t - th > span:
             break
-        v = opened if grip else dist
+        v = {"pinch": row[1], "grip": row[2], "thumb": row[3] if len(row) > 3 else row[1]}[what]
         if v > most:
             when, most = th, v
         elif v < most - noise:                   # past the peak: the fingers were closing from there on
@@ -325,6 +327,58 @@ class Pinch:
 
 
 FINGER_JOINTS = ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))   # mcp, pip, dip, tip
+
+
+THUMB_PRESS_POINTS = (INDEX_MCP, 6, MIDDLE_MCP, 10)    # the index and middle fingers' big knuckles and middle joints
+
+
+def thumb_press(wlm):
+    """The thumb trigger ("finger gun", aim mode): how close the thumb tip is to the side of the hand (the index and middle
+    fingers' base and middle joints), world metres. Pressing the thumb down leaves the index fingertip, and so the aim,
+    nearly still (user, live: "it moves my index finger just a tiny bit but the thumb moves more"), where a pinch swings
+    it 229 px (median)."""
+    return min(math.dist(wlm[THUMB_TIP], wlm[k]) for k in THUMB_PRESS_POINTS)
+
+
+class ThumbTrigger:
+    """The finger gun's trigger: aim with the thumb raised, drop it against the side of the hand to press, raise it to let
+    go. The user's thumb rests against the hand much of the time (thumb-to-hand median 2.2 cm, often under 1 cm, live
+    2026-09-30), so a thumb that is merely down must never press: the trigger arms only after the thumb has been up
+    (over `off`) for `arm_s`, and a press is a drop under `on` for `min_frames` frames after that. Releasing (over `off`
+    for `off_frames` frames) ends the press and starts arming again."""
+
+    def __init__(self, on=0.015, off=0.03, arm_s=0.2, min_frames=2, off_frames=3):
+        self.on_thr, self.off_thr, self.arm_s, self.min_frames, self.off_frames = on, off, arm_s, min_frames, off_frames
+        self.reset()
+
+    def reset(self):
+        self.closed = False
+        self.up_since = None
+        self._run = 0
+
+    def update(self, v, t):
+        """'down', 'up' or None."""
+        if not self.closed:
+            if v > self.off_thr:
+                self.up_since = t if self.up_since is None else self.up_since
+                self._run = 0
+                return None
+            armed = self.up_since is not None and t - self.up_since >= self.arm_s
+            if v < self.on_thr and armed:
+                self._run += 1
+                if self._run >= self.min_frames:
+                    self.closed, self._run, self.up_since = True, 0, None
+                    return "down"
+            else:
+                self._run = 0
+                if v < self.on_thr:          # down without having been up long enough: stays disarmed
+                    self.up_since = None
+            return None
+        self._run = self._run + 1 if v > self.off_thr else 0
+        if self._run >= self.off_frames:
+            self.closed, self._run, self.up_since = False, 0, t
+            return "up"
+        return None
 
 
 def openness(wlm):
@@ -1573,6 +1627,13 @@ def main():
                     help="aim: the hand point the ray passes through: pip (the index finger's middle joint: 2x steadier than "
                          "the tip and the best calibrations, measured live), base (wrist and knuckles, steadiest, follows "
                          "finger aiming less) or tip (the fingertip itself)")
+    ap.add_argument("--trigger", choices=["pinch", "thumb"], default="pinch",
+                    help="aim: what grabs and holds a lock: pinch (thumb to index tip; moves the aim) or thumb (press the "
+                         "thumb against the side of the hand, a finger gun: the index, and the aim, stay put); with thumb, "
+                         "a pinch or a closed hand no longer grabs")
+    ap.add_argument("--thumb-on", type=float, default=0.015, help="thumb trigger presses below this thumb-to-hand distance (m)")
+    ap.add_argument("--thumb-off", type=float, default=0.03,
+                    help="thumb trigger: the thumb counts as raised (arming the trigger, or letting go) above this (m)")
     ap.add_argument("--face-prep", choices=["colour", "hand"], default="colour",
                     help="aim: the image the face tracker sees: colour (the camera's own, full size) or hand (the hand's "
                          "prepared image, e.g. half-size grey)")
@@ -1746,6 +1807,11 @@ def main():
                     elif parts[:1] == ["precision"] and len(parts) == 2:
                         precision.gain = min(max(float(parts[1]), 0.05), 1.0)
                         precision.reset()
+                    elif parts[:1] == ["trigger"] and len(parts) in (2, 4) and parts[1] in ("pinch", "thumb"):
+                        args.trigger = parts[1]
+                        if len(parts) == 4:
+                            thumb.on_thr, thumb.off_thr = float(parts[2]), float(parts[3])
+                        thumb.reset()
                     elif parts[:1] == ["nudge"] and len(parts) in (2, 3):
                         g = 0.0 if parts[1] == "off" else float(parts[1])
                         nudge.gain = min(max(g, 0.0), 1.0)
@@ -1811,6 +1877,7 @@ def main():
         threading.Thread(target=control_loop, name="control", daemon=True).start()
     pinch = Pinch(on=args.pinch_on, off=args.pinch_off, min_frames=2, off_frames=3)
     grip = Pinch(on=0.72, off=0.85, min_frames=3, off_frames=3)    # on openness: every finger curled = a closed hand
+    thumb = ThumbTrigger(on=args.thumb_on, off=args.thumb_off)          # the finger gun's trigger (aim mode)
     held_was = False              # a pinch or (with --grip on) a closed hand: what grabs and holds a lock
     grab_state = None             # "pending" | "active" | None, sent with each frame so the gesture engine stands down
     pending_frame = None
@@ -1978,7 +2045,7 @@ def main():
                     last_hand_frame, dumps = None, dumps + 1
             raw = pos = q = free = smooth = aim_hit_now = None
             nx = ny = None
-            ratio = dist = opened = float("nan")
+            ratio = dist = opened = pressed_m = float("nan")
             event = None
             if hand:
                 hands += 1
@@ -1988,6 +2055,7 @@ def main():
                 if res.hand_world_landmarks:
                     dist = pinch_dist([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
                     opened = openness([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
+                    pressed_m = thumb_press([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
                 if calibrating:
                     if cal_until is None:
                         cal_until = t_det + args.calibrate
@@ -2024,17 +2092,25 @@ def main():
                         pos = (fx.lead(ahead), fy.lead(ahead))
                     smooth = pos
                     if isinstance(mapper, AimMap) and nudge.enabled:
-                        pos = nudge(pos, t_det, freeze=pinch.closed or (args.grip == "on" and grip.closed))
+                        pos = nudge(pos, t_det, freeze=(thumb.closed if args.trigger == "thumb" else
+                                                        pinch.closed or (args.grip == "on" and grip.closed)))
                     else:
                         pos = precision(pos, t_det)
                     history.append((t_det, pos[0], pos[1]))
-                    hand_hist.append((t_det, 1.0 if math.isnan(dist) else dist, 1.0 if math.isnan(opened) else opened))
+                    hand_hist.append((t_det, 1.0 if math.isnan(dist) else dist, 1.0 if math.isnan(opened) else opened,
+                                      1.0 if math.isnan(pressed_m) else pressed_m))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
                     gevent = grip.update(opened) if not math.isnan(opened) else None
                     if gevent:
                         print(f"I,grip,{gevent}", file=sys.stderr, flush=True)
-                    held = pinch.closed or (args.grip == "on" and grip.closed)
+                    tevent = thumb.update(pressed_m, t_det) if not math.isnan(pressed_m) else None
+                    if tevent:
+                        print(f"I,trigger,{tevent},{pressed_m:.3f}", file=sys.stderr, flush=True)
+                        if tevent == "down":
+                            sound.play("Tink")
+                    thumb_mode = isinstance(mapper, AimMap) and args.trigger == "thumb"
+                    held = thumb.closed if thumb_mode else (pinch.closed or (args.grip == "on" and grip.closed))
                     held_down = held and not held_was
                     held_was = held
                     if 0 < raw[0] < sw - 1 and 0 < raw[1] < sh - 1:  # clamped at an edge is not "still"
@@ -2046,8 +2122,8 @@ def main():
                     click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
                     if held_down and isinstance(mapper, AimMap):
                         # the pinch moved the fingertip and the aim with it: grab where the cursor was before it began
-                        rw = rewind_point(history, hand_hist, t_det,
-                                          grip=not pinch.closed and args.grip == "on" and grip.closed)
+                        rw = rewind_point(history, hand_hist, t_det, what="thumb" if thumb_mode else (
+                            "grip" if (not pinch.closed and args.grip == "on" and grip.closed) else "pinch"))
                         if rw is not None:
                             print(f"I,rewind,{math.hypot(pos[0] - rw[0], pos[1] - rw[1]):.0f}px", file=sys.stderr, flush=True)
                             click_at = pos = rw
@@ -2094,7 +2170,8 @@ def main():
                     if event == "down":
                         click_at = pos
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
-                        sound.play("Tink")
+                        if not thumb_mode:            # with the finger gun, only the trigger sounds
+                            sound.play("Tink")
                         if args.click:
                             cursor.press(*click_at)
                     elif event == "up":
@@ -2132,6 +2209,7 @@ def main():
                     print(f"P,{t_det - t0:.2f},up,lost,0,0", file=sys.stderr, flush=True)
                 pinch.reset()
                 grip.reset()
+                thumb.reset()
                 held_was = False
                 hover = None
                 overlay.update(None, visible=False)             # the ring vanishing says "hand lost"
