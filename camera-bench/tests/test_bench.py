@@ -4,9 +4,9 @@ import os
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-from bench import (AbsoluteMap, Marker, OneEuro, Pinch, Presence, RelativeMap, jitter_rms, lead_gain,  # noqa: E402
+from bench import (AbsoluteMap, Lock, Marker, OneEuro, Pinch, Presence, RelativeMap, jitter_rms, lead_gain,  # noqa: E402
                    pinch_dist, pinch_ratio, point_of, rect_from_sweep, still_windows, INDEX_TIP, THUMB_TIP,
-                   WRIST, MIDDLE_MCP)
+                   WRIST, MIDDLE_MCP, POINTS)
 
 fails = 0
 
@@ -140,6 +140,45 @@ check((x2, y2) == (x, y), "reacquiring the hand after loss does not jump")
 # --- marker: a 160 px square centred on Quartz (top-left) point -> AppKit (bottom-left) origin ---
 check(Marker.origin(100, 50, 160, 1000) == (20, 870), "marker origin flips y and centres the square")
 check(Marker(enabled=False).win is None, "disabled marker creates no window")
+
+# --- anchor points: the thumb joint does not move when the index finger curls ---
+lm = [(0.5, 0.5, 0.0)] * 21
+lm = list(lm)
+lm[3] = (0.40, 0.60, 0.0)          # thumb IP
+lm[8] = (0.55, 0.30, 0.0)          # index tip
+lm[2], lm[5] = (0.38, 0.70, 0.0), (0.50, 0.55, 0.0)
+check(point_of(lm, "thumb") == (0.40, 0.60), "thumb = the thumb's middle joint")
+check(point_of(lm, "tip") == (0.55, 0.30), "tip = the index fingertip")
+check(point_of(lm, "web") == (0.44, 0.625), "web = between thumb base and index knuckle")
+curled = list(lm)
+curled[8] = (0.45, 0.55, 0.0)      # the index curls toward the thumb
+check(point_of(curled, "thumb") == point_of(lm, "thumb"), "curling the index does not move the thumb anchor")
+check(set(POINTS) == {"tip", "thumb", "thumbtip", "web", "palm"}, "all anchor names are known")
+
+# --- hover lock: rest locks, small motion is ignored, a real move breaks out, a grab never breaks ---
+k = Lock(dwell=0.2, still=120, breakout=50)
+t = 0.0
+out = None
+for i in range(10):                 # resting at (500, 400) for 0.3 s
+    out = k.update((500 + (i % 2) * 3, 400), t, 20.0)
+    t += 1 / 30
+check(k.at is not None, "resting 0.2 s locks")
+held_at = k.at
+out = k.update((530, 420), t, 300.0)
+check(out == held_at, "a 36 px wobble stays locked")
+out = k.update((600, 400), t + 0.03, 900.0)
+check(k.at is None and out == (600, 400), "a 100 px move breaks out and the cursor follows")
+k = Lock(dwell=0.2, still=120, breakout=50)
+out = k.update((300, 300), 0.0, 400.0, held=True, grab_at=(290, 305))
+check(out == (290, 305), "a grab locks where the pointer was just before the pinch")
+out = k.update((500, 500), 0.1, 900.0, held=True)
+check(out == (290, 305), "while the grab is held nothing breaks the lock")
+out = k.update((500, 500), 0.2, 900.0, held=False)
+check(out == (500, 500) and k.at is None, "after the grab a far hand breaks out")
+k = Lock(dwell=0, still=120, breakout=50)
+for i in range(20):
+    out = k.update((100, 100), i / 30, 10.0)
+check(k.at is None, "dwell 0 turns hover locking off")
 
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

@@ -159,12 +159,65 @@ def pinch_dist(wlm):
     return math.dist(wlm[THUMB_TIP], wlm[INDEX_TIP])
 
 
+THUMB_MCP, THUMB_IP = 2, 3
+POINTS = ("tip", "thumb", "thumbtip", "web", "palm")
+
+
 def point_of(lm, which):
+    """The point that drives the cursor.
+    tip       index fingertip: precise, but it moves whenever the index curls or pinches
+    thumb     the thumb's middle joint: stays put while the index finger does the grabbing (user's design)
+    thumbtip  thumb tip
+    web       between the thumb base and the index knuckle: steady through a pinch
+    palm      mean of the four finger knuckles: steadiest, least precise"""
     if which == "tip":
         return lm[INDEX_TIP][0], lm[INDEX_TIP][1]
-    # palm: mean of the four finger knuckles (much steadier than a fingertip)
+    if which == "thumb":
+        return lm[THUMB_IP][0], lm[THUMB_IP][1]
+    if which == "thumbtip":
+        return lm[THUMB_TIP][0], lm[THUMB_TIP][1]
+    if which == "web":
+        return (lm[THUMB_MCP][0] + lm[INDEX_MCP][0]) / 2, (lm[THUMB_MCP][1] + lm[INDEX_MCP][1]) / 2
     ks = (INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)
     return sum(lm[k][0] for k in ks) / 4, sum(lm[k][1] for k in ks) / 4
+
+
+class Lock:
+    """Hover lock: once the pointer has rested (filtered speed under `still` px/s) for `dwell` s, the
+    cursor stays where it rested and small hand motion is ignored, so the finger that grabs cannot drag
+    it off the target. A move of more than `breakout` px from the locked spot releases it. While a grab
+    is held (pinch closed) it never releases; a grab that starts unlocked locks where the pointer was
+    just before the pinch (the Heisenberg spot). dwell 0 = hover locking off (grabs still lock)."""
+
+    def __init__(self, dwell=0.2, still=120.0, breakout=50.0):
+        self.dwell, self.still, self.breakout = dwell, still, breakout
+        self.at = None             # (x, y) while locked
+        self.still_since = None
+
+    def update(self, pos, t, speed, held=False, grab_at=None):
+        """The position to show for this frame."""
+        if self.at is not None:
+            if held or math.hypot(pos[0] - self.at[0], pos[1] - self.at[1]) <= self.breakout:
+                return self.at
+            self.at = None
+            self.still_since = None
+            return pos
+        if held:
+            self.at = grab_at or pos
+            return self.at
+        if self.dwell > 0 and speed < self.still:
+            if self.still_since is None:
+                self.still_since = t
+            elif t - self.still_since >= self.dwell:
+                self.at = pos
+                return self.at
+        else:
+            self.still_since = None
+        return pos
+
+    def reset(self):
+        self.at = None
+        self.still_since = None
 
 
 class AbsoluteMap:
@@ -430,7 +483,14 @@ def parse_rect(s):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--mode", choices=["abs", "rel"], default="abs")
-    ap.add_argument("--point", choices=["tip", "palm"], default="tip")
+    ap.add_argument("--point", choices=list(POINTS), default="tip",
+                    help="what drives the cursor: tip (index fingertip), thumb (thumb middle joint: the index can grab "
+                         "without moving it), thumbtip, web (thumb base/index knuckle), palm")
+    ap.add_argument("--lock-ms", type=float, default=0,
+                    help="hover lock: after resting this long the cursor locks in place until the hand moves more "
+                         "than --breakout px (0 = off; a pinch always locks for the length of the grab)")
+    ap.add_argument("--breakout", type=float, default=50, help="px the hand must move to leave a hover lock")
+    ap.add_argument("--lock-speed", type=float, default=120, help="px/s under which the pointer counts as resting")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -498,6 +558,7 @@ def main():
     sw, sh = cursor.screen()
     mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
+    lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout)
     if args.control:
         # live tuning from the parent (the gesture engine forwards its file's `pointer` line):
         #   filter <mincutoff> <beta> | lead <ms> | cursor on|off
@@ -516,6 +577,14 @@ def main():
                         if parts[1] == "on" and cursor.Q is None:
                             cursor.Q = __import__("Quartz")
                         cursor.enabled = parts[1] == "on"
+                    elif parts[:1] == ["point"] and len(parts) == 2 and parts[1] in POINTS:
+                        args.point = parts[1]
+                        fx.reset(); fy.reset(); lock.reset()      # a new anchor starts a new track
+                    elif parts[:1] == ["lock"] and len(parts) in (3, 4):
+                        lock.dwell, lock.breakout = float(parts[1]) / 1000, float(parts[2])
+                        if len(parts) == 4:
+                            lock.still = float(parts[3])
+                        lock.reset()
                     else:
                         raise ValueError(raw.strip())
                     print(f"I,control,{raw.strip()}", file=sys.stderr, flush=True)
@@ -647,11 +716,14 @@ def main():
                         sec_raw.append(raw)
                         sec_pos.append(pos)
                     last_pos = pos
+                    # Heisenberg: the pinch itself nudges the finger; use the position from before it.
+                    tb = t_det - args.heisenberg_ms / 1000
+                    click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
+                    pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=pinch.closed,
+                                      grab_at=click_at if event == "down" else None)
                     marker.move(*pos)
                     if event == "down":
-                        # Heisenberg: the pinch itself nudges the finger; use the position from before it.
-                        tb = t_det - args.heisenberg_ms / 1000
-                        click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
+                        click_at = pos
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
                         sound.play("Tink")
                         if args.click:
@@ -669,6 +741,7 @@ def main():
                 if isinstance(mapper, RelativeMap):
                     mapper.lost()
                 fx.reset(); fy.reset()
+                lock.reset()
                 last_pos = None
                 if cursor.down:
                     cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
@@ -696,7 +769,8 @@ def main():
                 found = "HAND" if hand else ("HAND (held)" if state == "held" else "NO HAND")
                 colour = (0, 220, 0) if hand else ((0, 200, 255) if state == "held" else (0, 0, 255))
                 cv2.putText(disp, found, (16, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.1, colour, 3)
-                label = "CALIBRATING: sweep your range" if calibrating else ("PINCH" if pinch.closed else "")
+                label = "CALIBRATING: sweep your range" if calibrating else (
+                    "PINCH (locked)" if pinch.closed else ("LOCKED" if lock.at is not None else ""))
                 if label:
                     cv2.putText(disp, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
                 cv2.imshow("camera bench (q quits)", disp)
