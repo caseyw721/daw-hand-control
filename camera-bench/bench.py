@@ -457,6 +457,7 @@ def rect_distance(p, frame):
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
+TEXT_BAR_MAX_H = 60          # px: a single-line text field this tall or less is a lock target
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
@@ -578,6 +579,11 @@ class AXProbe:
             return role, None, name, False
         small = frame[2] <= 120 and frame[3] <= 200
         if role in CONTROL_ROLES:
+            return role, frame, name, True
+        if role == "AXTextField" and frame[3] <= TEXT_BAR_MAX_H:
+            # a text bar (search box, address bar, name field) is a target too (user, live: "I don't have a way to click
+            # on the little bar where you type things in"); a tall text area is not, or a lock would hold the cursor
+            # anywhere over it
             return role, frame, name, True
         if role == "AXStaticText" and ("knob" in low or "readout" in low) and small:
             return "AXSlider", frame, name, True             # the pan knob under its readout: grab it like a knob
@@ -1297,6 +1303,46 @@ class Cursor:
         self.Q.CGEventSetIntegerValueField(ev, self.Q.kCGMouseEventDeltaY, int(round(dy)))
         self.Q.CGEventPost(self.Q.kCGHIDEventTap, ev)
 
+    KEYCODES = {"a": 0, "s": 1, "d": 2, "f": 3, "h": 4, "g": 5, "z": 6, "x": 7, "c": 8, "v": 9, "b": 11, "q": 12,
+                "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
+                "9": 25, "7": 26, "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40,
+                "n": 45, "m": 46, "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53,
+                "left": 123, "right": 124, "down": 125, "up": 126, "home": 115, "end": 119}
+
+    def key(self, combo):
+        """Press a key combination in the app in front, e.g. 'x', 'cmd+z', 'cmd+shift+s', 'return'. Returns False if a
+        part is unknown (nothing is pressed then)."""
+        if not self.enabled:
+            return False
+        Q = self.Q
+        mods = {"cmd": Q.kCGEventFlagMaskCommand, "shift": Q.kCGEventFlagMaskShift,
+                "option": Q.kCGEventFlagMaskAlternate, "alt": Q.kCGEventFlagMaskAlternate, "ctrl": Q.kCGEventFlagMaskControl}
+        parts = combo.lower().split("+")
+        flags = 0
+        for m in parts[:-1]:
+            if m not in mods:
+                return False
+            flags |= mods[m]
+        code = self.KEYCODES.get(parts[-1])
+        if code is None:
+            return False
+        for down in (True, False):
+            ev = Q.CGEventCreateKeyboardEvent(None, code, down)
+            Q.CGEventSetFlags(ev, flags)
+            Q.CGEventPost(Q.kCGHIDEventTap, ev)
+        return True
+
+    def type(self, text):
+        """Types text into the focused field of the app in front, one character at a time (Unicode, any layout)."""
+        if not self.enabled:
+            return
+        Q = self.Q
+        for ch in text:
+            for down in (True, False):
+                ev = Q.CGEventCreateKeyboardEvent(None, 0, down)
+                Q.CGEventKeyboardSetUnicodeString(ev, len(ch), ch)
+                Q.CGEventPost(Q.kCGHIDEventTap, ev)
+
     def warp(self, x, y):
         """Puts the cursor back without a move event (the end of a grab)."""
         if not self.enabled:
@@ -1814,6 +1860,11 @@ def main():
                     elif parts[:1] == ["precision"] and len(parts) == 2:
                         precision.gain = min(max(float(parts[1]), 0.05), 1.0)
                         precision.reset()
+                    elif parts[:1] == ["key"] and len(parts) == 2:
+                        if not cursor.key(parts[1]):
+                            raise ValueError(f"unknown key or hands off: {parts[1]}")
+                    elif parts[:1] == ["type"] and len(parts) >= 2:
+                        cursor.type(raw.strip()[5:])
                     elif parts[:1] == ["tap"] and len(parts) == 2 and parts[1] in ("on", "off"):
                         args.tap = parts[1]
                     elif parts[:1] == ["trigger"] and len(parts) in (2, 4) and parts[1] in ("pinch", "thumb"):
