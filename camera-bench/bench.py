@@ -307,6 +307,7 @@ CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AX
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
+STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 
 
 class Lock:
@@ -817,16 +818,20 @@ class Sound:
 class Overlay:
     """What the user sees instead of a small arrow (user, live: the cursor "should be like a camera button on an
     iPhone, a round fairly big smooth circle", and every button, knob and fader "should noticeably light up like
-    an overlay when hovered"). Two borderless, click-through windows above everything: a round ring that follows
-    the cursor, and a rounded highlight over the control it is on (brighter once locked, amber while grabbing).
-    Clicks pass through both."""
+    an overlay when hovered"). One transparent, click-through window covers the main display; the ring and the
+    highlight are layers inside it, moved with Core Animation in the same step as the cursor and flushed at once.
+    (The first version moved and resized two windows every frame: the ring trailed the arrow, user: "a ton of
+    latency between the cursor and your simulated cursor", and the frame loop stalled 250-500 ms at times.)
+    The highlight is at least `min_tile` px and `pad` px bigger than the control all round (user: "the tiles ...
+    could be wider"). Colours: white idle, blue hovered, green locked, amber grabbing."""
 
     IDLE, HOVER, LOCK, GRAB = (1.0, 1.0, 1.0), (0.25, 0.85, 1.0), (0.2, 0.95, 0.55), (1.0, 0.7, 0.15)
 
-    def __init__(self, size=64, enabled=True, pad=6):
-        self.size, self.enabled, self.pad = size, enabled, pad
-        self.ring = self.glow = None
+    def __init__(self, size=64, enabled=True, pad=14, min_tile=48):
+        self.size, self.enabled, self.pad, self.min_tile = size, enabled, pad, min_tile
+        self.win = self.ring = self.glow = None
         self.shown = None
+        self.last = None
         if not enabled:
             return
         import AppKit
@@ -834,83 +839,97 @@ class Overlay:
         self.AK, self.Q = AppKit, Quartz
         app = AppKit.NSApplication.sharedApplication()
         app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)  # no Dock icon
-        self.sh = int(AppKit.NSScreen.screens()[0].frame().size.height)
-        self.ring = self._window(size, size, radius=size / 2)
-        self.glow = self._window(40, 40, radius=10)
-        self.glow.orderOut_(None)
-        self.style(self.IDLE, None)
-
-    def _window(self, w, h, radius):
-        AK = self.AK
-        from Foundation import NSMakeRect
-        win = AK.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
-            NSMakeRect(0, 0, w, h), AK.NSWindowStyleMaskBorderless, AK.NSBackingStoreBuffered, False)
-        win.setLevel_(AK.NSScreenSaverWindowLevel)
+        screen = AppKit.NSScreen.screens()[0].frame()
+        self.sh = int(screen.size.height)
+        win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            screen, AppKit.NSWindowStyleMaskBorderless, AppKit.NSBackingStoreBuffered, False)
+        win.setLevel_(AppKit.NSScreenSaverWindowLevel)
         win.setOpaque_(False)
-        win.setBackgroundColor_(AK.NSColor.clearColor())
+        win.setBackgroundColor_(AppKit.NSColor.clearColor())
         win.setIgnoresMouseEvents_(True)
         win.setHasShadow_(False)
-        win.setCollectionBehavior_(AK.NSWindowCollectionBehaviorCanJoinAllSpaces | AK.NSWindowCollectionBehaviorStationary)
+        win.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                                   | AppKit.NSWindowCollectionBehaviorStationary
+                                   | AppKit.NSWindowCollectionBehaviorIgnoresCycle)
         view = win.contentView()
         view.setWantsLayer_(True)
-        layer = view.layer()
-        layer.setCornerRadius_(radius)
-        layer.setMasksToBounds_(True)
+        root = view.layer()
+        self.glow = Quartz.CALayer.layer()
+        self.glow.setCornerRadius_(10)
+        self.glow.setBorderWidth_(3)
+        self.ring = Quartz.CALayer.layer()
+        self.ring.setBounds_(((0, 0), (size, size)))
+        self.ring.setCornerRadius_(size / 2)
+        self.ring.setBorderWidth_(max(3.0, size / 16))
+        for layer in (self.glow, self.ring):
+            layer.setHidden_(True)
+            root.addSublayer_(layer)
         win.orderFrontRegardless()
-        return win
+        self.win = win
+        self.style(self.IDLE, None)
 
     def _colour(self, rgb, a):
         return self.AK.NSColor.colorWithSRGBRed_green_blue_alpha_(rgb[0], rgb[1], rgb[2], a).CGColor()
 
     def style(self, rgb, fill_alpha):
-        """Ring colour: white idle, blue over a control, green locked, amber grabbing."""
         key = (rgb, fill_alpha)
         if self.ring is None or key == self.shown:
             return
         self.shown = key
-        Q = self.Q
-        Q.CATransaction.begin()
-        Q.CATransaction.setDisableActions_(True)
-        layer = self.ring.contentView().layer()
-        layer.setBorderWidth_(max(3.0, self.size / 16))
-        layer.setBorderColor_(self._colour(rgb, 0.95))
-        layer.setBackgroundColor_(self._colour(rgb, 0.22 if fill_alpha is None else fill_alpha))
-        glow = self.glow.contentView().layer()
-        glow.setBorderWidth_(3.0)
-        glow.setBorderColor_(self._colour(rgb, 0.95))
-        glow.setBackgroundColor_(self._colour(rgb, 0.18))
-        Q.CATransaction.commit()
+        self.ring.setBorderColor_(self._colour(rgb, 0.95))
+        self.ring.setBackgroundColor_(self._colour(rgb, 0.22 if fill_alpha is None else fill_alpha))
+        self.glow.setBorderColor_(self._colour(rgb, 0.95))
+        self.glow.setBackgroundColor_(self._colour(rgb, 0.20))
+
+    def tile(self, target):
+        """The highlight's frame for a control: `pad` bigger all round, at least `min_tile` each way."""
+        x, y, w, h = target
+        W, H = max(w + 2 * self.pad, self.min_tile), max(h + 2 * self.pad, self.min_tile)
+        return (x + w / 2 - W / 2, y + h / 2 - H / 2, W, H)
 
     def update(self, pos, target=None, locked=False, grabbing=False, visible=True):
         """pos: Quartz (top-left) point; target: the hovered control's (x, y, w, h) or None."""
         if self.ring is None:
             return
-        if not visible or pos is None:
-            self.ring.orderOut_(None)
-            self.glow.orderOut_(None)
-            self.pump()
+        state = None if (not visible or pos is None) else (round(pos[0]), round(pos[1]), target, locked, grabbing)
+        if state == self.last:
             return
-        self.style(self.GRAB if grabbing else self.LOCK if locked else self.HOVER if target else self.IDLE,
-                   0.45 if grabbing else None)
-        self.ring.setFrameOrigin_((pos[0] - self.size / 2, self.sh - pos[1] - self.size / 2))
-        self.ring.orderFrontRegardless()
-        if target:
-            x, y, w, h = target
-            p = self.pad
-            self.glow.setFrame_display_(((x - p, self.sh - (y + h) - p), (w + 2 * p, h + 2 * p)), False)
-            self.glow.orderFrontRegardless()
-            self.ring.orderFrontRegardless()      # the ring stays on top of the highlight
+        self.last = state
+        Q = self.Q
+        Q.CATransaction.begin()
+        Q.CATransaction.setDisableActions_(True)          # no implicit 0.25 s animations: move now
+        if state is None:
+            self.ring.setHidden_(True)
+            self.glow.setHidden_(True)
         else:
-            self.glow.orderOut_(None)
-        self.pump()
+            self.style(self.GRAB if grabbing else self.LOCK if locked else self.HOVER if target else self.IDLE,
+                       0.45 if grabbing else None)
+            self.ring.setPosition_((pos[0], self.sh - pos[1]))
+            self.ring.setHidden_(False)
+            if target:
+                x, y, w, h = self.tile(target)
+                self.glow.setFrame_(((x, self.sh - y - h), (w, h)))
+                self.glow.setHidden_(False)
+            else:
+                self.glow.setHidden_(True)
+        Q.CATransaction.commit()
+        Q.CATransaction.flush()                            # hand it to the render server now, not at the next run loop
 
     def pump(self):
+        if self.win is None:
+            return
         app = self.AK.NSApp
         while True:
             ev = app.nextEventMatchingMask_untilDate_inMode_dequeue_(self.AK.NSEventMaskAny, None, self.AK.NSDefaultRunLoopMode, True)
             if ev is None:
                 break
             app.sendEvent_(ev)
+
+    def close(self):
+        if self.win is not None:
+            self.win.orderOut_(None)
+            self.win.close()
+            self.win = self.ring = self.glow = None
 
 
 class Marker:
@@ -1239,6 +1258,7 @@ def main():
     held_was = False              # a pinch or (with --grip on) a closed hand: what grabs and holds a lock
     grab_state = None             # "pending" | "active" | None, sent with each frame so the gesture engine stands down
     pending_frame = None
+    hover = None                  # the control highlighted last frame (sticky, see STICKY_PX)
     presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
     calibrating = args.mode == "abs" and args.calibrate > 0
@@ -1305,14 +1325,16 @@ def main():
                     mapper.pad = (args.pad[0] / 100, args.pad[1] / 100)
                 ring = nonlocal_state.pop("ring", None)
                 if ring is not None:                 # AppKit windows are made and closed on this (the main) thread
-                    overlay.update(None, visible=False)
+                    overlay.close()
                     overlay = Overlay(size=ring or 64, enabled=bool(ring))
                 if nonlocal_state.pop("recenter", None) and isinstance(mapper, MetricMap):
                     mapper.recenter_next = True
                     lock.reset()
                     sound.play("Glass")
+            t_mark = time.perf_counter()
             ok, frame = cap.read()
             t_frame = time.perf_counter()
+            slow = [("camera", t_frame - t_mark)]
             if not ok:
                 print("I,camera read failed", file=sys.stderr, flush=True)
                 time.sleep(0.01)
@@ -1330,6 +1352,7 @@ def main():
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             res = landmarker.detect_for_video(img, int((t_frame - t0) * 1000))
             t_det = time.perf_counter()
+            slow.append(("detect", t_det - t_frame))
             det_ms.append((t_det - t_frame) * 1000)
 
             hand = bool(res.hand_landmarks)
@@ -1406,6 +1429,12 @@ def main():
                     if probe is None and (lock.dwell > 0 or grab.mode != "off" or overlay.ring is not None):
                         probe = AXProbe(zone=args.zone)         # turned on live by `lock <ms> ...` or `grab ...`
                     target = probe.control_at(pos) if probe else None
+                    # the control already highlighted stays the target until the cursor is clearly past it (user: the
+                    # tiles "could be wider when they're detected to be the thing" being hovered over)
+                    if hover is not None and rect_distance(pos, hover) <= lock.zone + STICKY_PX and (
+                            target is None or rect_distance(pos, target) > 0):
+                        target = hover
+                    hover = target
                     free = pos                                  # the unlocked filtered position: what a grab drags by
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
                                       grab_at=click_at if held_down else None, target=target)
@@ -1413,8 +1442,8 @@ def main():
                         probe.pos = pos
                     marker.move(*pos)
                     # the grab session: pinch-and-hold (or a closed hand) presses, vertical movement drags, release returns the cursor
-                    if grab.mode != "off":
-                        if held_down:
+                    if grab.mode != "off" and (cursor.enabled or grab.at is not None):   # no grabs while hands are off
+                        if held_down and cursor.enabled:
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
                             grab.begin(pos, t_det, free[1], role)
                         if held and grab.at is not None:
@@ -1442,8 +1471,11 @@ def main():
                             cursor.release(*pos)
                     elif not grab.active:
                         cursor.move(*pos)
+                    t_ov = time.perf_counter()
+                    slow.append(("track", t_ov - t_det))
                     overlay.update(pos, lock.frame if lock.at is not None else target, locked=lock.at is not None,
                                    grabbing=grab.active, visible=cursor.enabled)
+                    slow.append(("overlay", time.perf_counter() - t_ov))
             elif state == "held":
                 pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
             elif state == "lost":
@@ -1468,6 +1500,7 @@ def main():
                 pinch.reset()
                 grip.reset()
                 held_was = False
+                hover = None
                 overlay.update(None, visible=False)             # the ring vanishing says "hand lost"
             if frames_out and pending_frame:
                 # written after this frame's grab handling, so the engine sees a released grab on the release frame
@@ -1534,9 +1567,17 @@ def main():
                             "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else ""))))
                 if label:
                     cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+                t_pv = time.perf_counter()
                 cv2.imshow("camera bench (q quits)", disp)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
+                key = cv2.waitKey(1) & 0xFF
+                slow.append(("preview", time.perf_counter() - t_pv))
+                if key == ord("q"):
                     break
+            elif overlay.win is not None:
+                overlay.pump()                  # no preview window runs AppKit's events: do it here
+            worst = max(slow, key=lambda x: x[1])
+            if worst[1] > 0.08:                 # name any stall, so a hitch is never a mystery (found live: 250-500 ms)
+                print(f"I,slow,{worst[0]},{worst[1] * 1000:.0f}ms", file=sys.stderr, flush=True)
 
             now = time.perf_counter()
             if now - last_report >= 1.0:

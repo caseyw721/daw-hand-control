@@ -385,6 +385,9 @@ m, p_, d, tip = FINGER_JOINTS[0]
 half[p_], half[d], half[tip] = straight[p_], straight[d], straight[tip]
 check(openness(half) > 0.9, "one straight finger is not a closed hand (pointing)")
 Overlay(enabled=False).update((10, 10), (0, 0, 5, 5), locked=True)   # disabled: a no-op, no AppKit needed
+ov = Overlay(enabled=False, pad=14, min_tile=48)
+check(ov.tile((100, 100, 18, 18)) == (85.0, 85.0, 48, 48), f"a small knob's tile is at least 48 px, centred ({ov.tile((100, 100, 18, 18))})")
+check(ov.tile((197, 901, 20, 180)) == (183.0, 887.0, 48, 208), f"a fader's tile is 14 px bigger all round ({ov.tile((197, 901, 20, 180))})")
 # --- the grab state travels with the frame ---
 import io, json as _json  # noqa: E402
 from frames import FrameWriter  # noqa: E402
