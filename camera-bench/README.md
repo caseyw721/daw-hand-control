@@ -41,6 +41,7 @@ Useful options (`run.sh --help` lists them all):
 | `--presence 0.4 --tracking 0.4` | MediaPipe confidence floors; lower keeps the hand through harder poses at the cost of occasional false landmarks |
 | `--quiet` | No sounds |
 | `--no-cursor` | Measure only |
+| `--mode aim` | Aim from your eye through your fingertip (see "Aim mode" below); `--aim-calibrate` starts with the five-dot calibration |
 | `--preview` | Show the camera, landmarks, the box and pinch state (adds a few ms; off for measurements) |
 | `--log run.csv` | Per-frame timings, positions, both pinch measures and whether the frame was coasted |
 | `--marker [PX]` | A big black square with a white border (160 px by default) follows the pointer in a click-through window above everything, so a slow-motion video shows unambiguously which frame the pointer first moved in. Works with `--no-cursor` |
@@ -49,6 +50,43 @@ Lines on stderr: `I,...` information (camera, screen, box, warnings), `P,<t>,<do
 each pinch, and once a second
 `S,<fps>,<detect ms p50>,<detect ms p95>,<loop ms p50>,<hand %>,<still>,<jitter px rms>,<pinch>,<held gaps>,<lost>`
 where `held gaps` counts short losses coasted through and `lost` the real ones.
+
+## Aim mode: from your eye through your fingertip (`--mode aim`)
+
+People don't point along the finger. They line the fingertip up with the target from the eye, and studies of
+mid-air pointing find that eye-fingertip ray more accurate than the finger's direction. The camera sees the face
+as well as the hand, so aim mode draws the line from the eye through the index fingertip and follows it to the
+screen. Both ends are positions, the steady measurement:
+
+- **Eye**: MediaPipe's face landmarker (`models/face_landmarker.task`, fetched by `setup.sh`). The eye point is the
+  middle of each eye's two corners (they sit on the skull, so they don't move when the eye turns), averaged over
+  both eyes (`--eye left|right` to pick one). Its distance from the camera comes from the eyes' spacing in pixels,
+  taken as 63 mm apart. The face runs *after* the cursor has moved, in the time the camera read would spend
+  waiting, so it adds nothing to the cursor's latency (~5 ms on a face, measured on MediaPipe's sample portrait).
+  When the face is out of view (a hand between your face and the camera, pointing near the top-middle) the last
+  eye position is kept, and the preview says `NO FACE: eye held`.
+- **Fingertip**: the hand's distance from its size (the same fit `metric` uses) plus how far the tip sits in front
+  of the hand's centre.
+- **Screen**: the camera sits in the screen's plane looking straight out, so the ray's hit on that plane, in
+  metres, becomes points through the display's physical size (`CGDisplayScreenSize`).
+
+Both depths are smoothed hard (heads and reaching hands change depth slowly), because a depth error swings the hit
+sideways. The camera's focal length is a guess (70° across), but it scales both depths alike and mostly cancels.
+
+**Calibration**: `--aim-calibrate`, or the control line `calibrate` (voice: "calibrate pointing"). Five dots appear
+one at a time: the centre, then the corners 15 % in. Point at each and hold; the green disc fills over a second of
+steady aim, a Tink marks each capture, and a dot not captured in 12 s is skipped (Basso). The fit is scale and
+offset each way, which absorbs your own eye spacing and hand size, your dominant eye and the camera's exact
+place. It is saved to `~/Library/Application Support/DAW Control/aim-calibration.json` and reused for this display
+size (the camera and the screen move together, so tilting the lid does not spoil it). `recenter` makes where you
+aim now the screen's centre. The cursor stays put while calibrating.
+
+Simulated (tests/test_bench.py, a synthetic face and hand drawn the way the tracker reads them): a user whose eyes
+are 57 or 69 mm apart misses by up to 125-142 pt uncalibrated and by 0 after calibration while the head stays
+where it was. With the head moved 4 cm sideways and 5 cm back the miss is 21-26 pt. Landmark noise of 1 px on every
+hand point gives 5 pt rms before the filters. **Not yet tried live.** Known risks: the camera may track a finger
+pointing straight at it poorly, pointing low on the screen needs the hand low in the camera's view (about 43°
+top to bottom), and the hand can hide the face near the top-middle.
 
 ## Testing against the ring
 

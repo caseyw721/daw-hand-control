@@ -10,6 +10,7 @@ reported (P line, Tink sound) but never clicks unless --click is given.
     ./run.sh --calibrate 5       # abs: the first 5 s with a hand in view set the box (sweep your range)
     ./run.sh --rect .3,.4,.9,.95 # abs: use this box of the raw camera frame (x0,y0,x1,y1)
     ./run.sh --mode rel          # relative ("air mouse") pointing
+    ./run.sh --aim-calibrate     # aim from your eye through your fingertip; point at five dots first (saved)
     ./run.sh --point palm        # steadier point: palm centre instead of fingertip
     ./run.sh --preview           # show the camera with landmarks and the box (costs a few ms)
     ./run.sh --no-cursor         # measure only, leave the cursor alone
@@ -262,6 +263,7 @@ def pinch_dist(wlm):
 THUMB_MCP, THUMB_IP = 2, 3
 POINTS = ("tip", "base", "thumb", "thumbip", "thumbtip", "web", "palm")
 PREPS = ("none", "enhance", "gray")
+MAPS = ("abs", "rel", "metric", "aim")
 
 
 def point_of(lm, which):
@@ -673,6 +675,309 @@ class MetricMap:
         return f_px / self.s if self.s else None
 
 
+FACE_MODEL = os.path.join(HERE, "models", "face_landmarker.task")
+EYE_CORNERS = ((33, 133), (362, 263))    # MediaPipe face mesh: the outer and inner corner of each eye
+IPD_M = 0.063                            # adult eye spacing, average; the calibration absorbs a user's own
+CAMERA_HFOV = 70.0                       # degrees across, MacBook camera (a guess: its error mostly cancels, see AimMap)
+AIM_DOTS = ((0.5, 0.5), (0.15, 0.15), (0.85, 0.15), (0.85, 0.85), (0.15, 0.85))
+AIM_CAL_PATH = os.path.expanduser("~/Library/Application Support/DAW Control/aim-calibration.json")
+
+
+def eye_centres(face):
+    """The two eye centres of a face as normalised (x, y, z), the image's left one first (on the unmirrored frame
+    that is the user's right eye). Each is the middle of the eye's two corners: they sit on the skull, so unlike the
+    iris they stay put when the eye turns towards a target."""
+    pts = [tuple((face[a][k] + face[b][k]) / 2 for k in range(3)) for a, b in EYE_CORNERS]
+    return tuple(sorted(pts))
+
+
+def back_project(u, v, z, cam_w, cam_h, f_px):
+    """Camera pixel (u, v) at depth z (m) -> a point in the screen's frame, metres: X to the user's right, Y down,
+    Z out of the screen towards the user, origin at the camera. The camera sits in the screen's plane looking
+    straight out of it (a laptop lid), so the screen is the plane Z = 0. X is mirrored: the camera faces the user."""
+    return (-(u - cam_w / 2) * z / f_px, (v - cam_h / 2) * z / f_px, z)
+
+
+def aim_hit(eye, tip, min_gap=0.05):
+    """Where the line from the eye through the fingertip meets the screen (X, Y metres), or None unless the fingertip
+    is at least `min_gap` in front of the eye."""
+    gap = eye[2] - tip[2]
+    if gap < min_gap or tip[2] <= 0:
+        return None
+    k = eye[2] / gap
+    return (eye[0] + (tip[0] - eye[0]) * k, eye[1] + (tip[1] - eye[1]) * k)
+
+
+def load_aim_cal(sw, sh, path=AIM_CAL_PATH):
+    """The saved calibration's map (a, b, c, d) for this screen size, or None. The camera and the screen move
+    together, so it stays good until the display resolution or the person changes."""
+    try:
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        return tuple(d["map"]) if d.get("screen") == [sw, sh] else None
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
+def save_aim_cal(sw, sh, fit, eye, path=AIM_CAL_PATH):
+    import json
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump({"screen": [sw, sh], "map": list(fit["map"]), "rms_px": round(fit["rms"], 1), "eye": eye,
+                   "dots": fit["dots"], "saved": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=1)
+
+
+class AimMap:
+    """Aim from the eye through the fingertip (plan, 2026-09-30). People don't point along the finger: they line the
+    fingertip up with the target from the eye, and studies of mid-air pointing find that ray more accurate than the
+    finger's own direction. The camera sees the face as well as the hand, so both ends of the ray are positions, the
+    steady measurement. The eye comes from MediaPipe's face landmarks, its distance from the eyes' spacing in px
+    (IPD_M apart); the fingertip from the hand landmarks, its distance from the hand's size (px_per_metre) plus how
+    far the tip sits in front of the hand's centre (world z). The ray is followed to the screen's plane, and the
+    display's physical size turns metres into points. The camera's focal length is a guess, but it scales both
+    depths alike and the hit barely moves. Depths are smoothed hard: a head and a reaching hand change depth slowly,
+    and a depth error swings the hit sideways. The five-dot calibration then fits scale and offset each way, which
+    absorbs the user's own eye spacing and hand size, the dominant eye and the camera's exact place. When the face
+    is out of view (the hand between face and camera, pointing near the top-middle) the last eye is kept."""
+
+    def __init__(self, screen_w, screen_h, mm=None, eye="mid", cal=None, hfov=CAMERA_HFOV):
+        self.w, self.h = screen_w, screen_h
+        mm = mm or (345.0, 223.0)                         # MacBook Pro 16" when the display does not say
+        self.pitch = (mm[0] / 1000 / screen_w, mm[1] / 1000 / screen_h)    # metres per point
+        self.physical = (1 / self.pitch[0], screen_w / 2, 1 / self.pitch[1], 0.0)   # x = a X + b, y = c Y + d
+        self.map = tuple(cal) if cal else self.physical
+        self.calibrated = bool(cal)
+        self.eye, self.hfov = eye, hfov
+        self.eye_px = None       # the chosen eye in camera px, smoothed
+        self.ipd = None          # the eyes' spacing in camera px (3-D, so a turned head is not foreshortened), smoothed
+        self.face_t = None       # when the face was last seen
+        self.eyes = None         # this frame's eye centres (normalised), for the preview and the frame record
+        self.s = None            # hand px per metre, smoothed
+        self.dz = 0.0            # the fingertip's depth relative to the hand's centre (m), smoothed
+        self.E = self.F = self.hit = None
+        self.recenter_next = False
+
+    def f_px(self, cam_w):
+        return (cam_w / 2) / math.tan(math.radians(self.hfov / 2))
+
+    def see_face(self, face, cam_w, cam_h, t):
+        """One frame's face landmarks (normalised (x, y, z) list); None when the face was not found."""
+        if not face:
+            self.eyes = None
+            return
+        l, r = self.eyes = eye_centres(face)
+        ipd = math.sqrt(((l[0] - r[0]) * cam_w) ** 2 + ((l[1] - r[1]) * cam_h) ** 2 + ((l[2] - r[2]) * cam_w) ** 2)
+        p = l if self.eye == "right" else r if self.eye == "left" else ((l[0] + r[0]) / 2, (l[1] + r[1]) / 2)
+        u, v = p[0] * cam_w, p[1] * cam_h
+        stale = self.face_t is None or t - self.face_t > 1.0
+        if stale or self.eye_px is None:
+            self.eye_px, self.ipd = (u, v), ipd
+        else:
+            self.eye_px = (self.eye_px[0] + 0.3 * (u - self.eye_px[0]), self.eye_px[1] + 0.3 * (v - self.eye_px[1]))
+            self.ipd += 0.08 * (ipd - self.ipd)
+        self.face_t = t
+
+    def eye_point(self, cam_w, cam_h):
+        if self.eye_px is None or not self.ipd:
+            return None
+        f = self.f_px(cam_w)
+        return back_project(self.eye_px[0], self.eye_px[1], f * IPD_M / self.ipd, cam_w, cam_h, f)
+
+    def __call__(self, img, world, cam_w, cam_h):
+        """The screen point the user aims at, clamped to the screen, or None (no face seen yet, no world landmarks,
+        or the fingertip not in front of the eye). self.hit keeps the hit in metres for the calibration."""
+        self.hit = None
+        if not (img and world):
+            return None
+        s = px_per_metre(img, world, cam_w, cam_h)
+        if s and s > 0:
+            self.s = s if self.s is None else self.s + 0.12 * (s - self.s)
+        dz = world[INDEX_TIP][2] - sum(p[2] for p in world) / len(world)
+        self.dz += 0.3 * (dz - self.dz)
+        E = self.eye_point(cam_w, cam_h)
+        if E is None or not self.s:
+            return None
+        f = self.f_px(cam_w)
+        self.E = E
+        self.F = back_project(img[INDEX_TIP][0] * cam_w, img[INDEX_TIP][1] * cam_h, f / self.s + self.dz, cam_w, cam_h, f)
+        self.hit = aim_hit(E, self.F)
+        if self.hit is None:
+            return None
+        a, b, c, d = self.map
+        if self.recenter_next:                            # where the user aims now becomes the screen's centre
+            b, d = self.w / 2 - a * self.hit[0], self.h / 2 - c * self.hit[1]
+            self.map, self.recenter_next = (a, b, c, d), False
+        x, y = a * self.hit[0] + b, c * self.hit[1] + d
+        return min(max(x, 0.0), self.w - 1), min(max(y, 0.0), self.h - 1)
+
+
+class AimCalibration:
+    """Five dots, one at a time (the centre, then the corners 15 % in): point at each until it is captured. A dot is
+    captured once the uncalibrated hit has held within `spread` m (80 % of the samples) for `hold` s, counted from
+    `settle` s after the dot appeared (time to get there); a dot not captured in `timeout` s is skipped. fit() gives
+    the scale and offset each way (least squares) and the rms miss in points."""
+
+    def __init__(self, sw, sh, dots=AIM_DOTS, settle=0.8, hold=1.0, spread=0.02, timeout=12.0):
+        self.sw, self.sh = sw, sh
+        self.dots = [(fx * sw, fy * sh) for fx, fy in dots]
+        self.settle, self.hold, self.spread, self.timeout = settle, hold, spread, timeout
+        self.i, self.t_dot = 0, None
+        self.win = collections.deque()
+        self.got = []            # (dot px, hit m)
+        self.skipped = 0
+        self.progress = 0.0
+
+    @property
+    def current(self):
+        return self.dots[self.i] if self.i < len(self.dots) else None
+
+    @property
+    def done(self):
+        return self.i >= len(self.dots)
+
+    def _next(self, t):
+        self.i, self.t_dot, self.progress = self.i + 1, t, 0.0
+        self.win.clear()
+
+    def feed(self, t, hit):
+        """One frame: hit = the uncalibrated (X, Y) in metres, or None. Returns 'captured', 'skipped' or None."""
+        if self.done:
+            return None
+        if self.t_dot is None:
+            self.t_dot = t
+        if t - self.t_dot > self.timeout:
+            self.skipped += 1
+            self._next(t)
+            return "skipped"
+        if t - self.t_dot < self.settle or hit is None:
+            return None
+        self.win.append((t, hit))
+        while t - self.win[0][0] > self.hold:
+            self.win.popleft()
+        xs = sorted(h[0] for _, h in self.win)
+        ys = sorted(h[1] for _, h in self.win)
+        med = (xs[len(xs) // 2], ys[len(ys) // 2])
+        far = sum(1 for _, h in self.win if math.hypot(h[0] - med[0], h[1] - med[1]) > self.spread)
+        steady = far <= 0.2 * len(self.win)
+        span = t - self.win[0][0]
+        self.progress = min(span / self.hold, 1.0) if steady else 0.0
+        if steady and span >= 0.9 * self.hold and len(self.win) >= 12:
+            self.got.append((self.dots[self.i], med))
+            self._next(t)
+            return "captured"
+        if not steady:                                   # restart the hold from the newest sample
+            while len(self.win) > 1:
+                self.win.popleft()
+        return None
+
+    def fit(self, physical):
+        """{'map': (a, b, c, d), 'rms': px, 'dots': [...]} from the captured dots, or (None, reason). Needs three dots
+        spanning both ways; a scale more than 3x off the display's physical size is refused (bad depths)."""
+        if len(self.got) < 3:
+            return None, f"only {len(self.got)} of {len(self.dots)} dots captured"
+
+        def line(ps, ss):
+            n = len(ps)
+            mp, ms = sum(ps) / n, sum(ss) / n
+            var = sum((p - mp) ** 2 for p in ps)
+            if var < 1e-8:
+                return None
+            k = sum((p - mp) * (s - ms) for p, s in zip(ps, ss)) / var
+            return k, ms - k * mp
+
+        fx = line([h[0] for _, h in self.got], [d[0] for d, _ in self.got])
+        fy = line([h[1] for _, h in self.got], [d[1] for d, _ in self.got])
+        if fx is None or fy is None:
+            return None, "the captured dots do not span the screen both ways"
+        (a, b), (c, d) = fx, fy
+        for k, k0, name in ((a, physical[0], "across"), (c, physical[2], "down")):
+            if not (k0 / 3 <= k <= k0 * 3):
+                return None, f"scale {name} is {k / k0:.2f}x the display's, depths look wrong"
+        miss = [(a * h[0] + b - dt[0]) ** 2 + (c * h[1] + d - dt[1]) ** 2 for dt, h in self.got]
+        rms = math.sqrt(sum(miss) / len(miss))
+        return {"map": (a, b, c, d), "rms": rms,
+                "dots": [[round(dt[0]), round(dt[1]), round(math.sqrt(m))] for (dt, _), m in zip(self.got, miss)]}, ""
+
+
+class AimDots:
+    """The calibration's dot: a red centre, a white ring, and a green disc that grows while the aim holds steady.
+    Its own click-through full-screen window, made when the calibration starts and closed when it ends."""
+
+    def __init__(self):
+        import AppKit
+        import Quartz
+        self.AK, self.Q = AppKit, Quartz
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)
+        screen = AppKit.NSScreen.screens()[0].frame()
+        self.sh = int(screen.size.height)
+        win = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            screen, AppKit.NSWindowStyleMaskBorderless, AppKit.NSBackingStoreBuffered, False)
+        win.setLevel_(AppKit.NSScreenSaverWindowLevel)
+        win.setOpaque_(False)
+        win.setBackgroundColor_(AppKit.NSColor.clearColor())
+        win.setIgnoresMouseEvents_(True)
+        win.setHasShadow_(False)
+        win.setCollectionBehavior_(AppKit.NSWindowCollectionBehaviorCanJoinAllSpaces
+                                   | AppKit.NSWindowCollectionBehaviorStationary)
+        root = win.contentView()
+        root.setWantsLayer_(True)
+        root = root.layer()
+
+        def disc(size, rgba, border=None):
+            layer = Quartz.CALayer.layer()
+            layer.setBounds_(((0, 0), (size, size)))
+            layer.setCornerRadius_(size / 2)
+            layer.setBackgroundColor_(AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*rgba).CGColor())
+            if border:
+                layer.setBorderWidth_(4)
+                layer.setBorderColor_(AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(*border).CGColor())
+            root.addSublayer_(layer)
+            return layer
+
+        self.ring = disc(96, (0, 0, 0, 0.25), border=(1, 1, 1, 0.95))
+        self.fill = disc(96, (0.2, 0.95, 0.55, 0.6))
+        self.dot = disc(16, (1.0, 0.2, 0.2, 1.0))
+        self.text = Quartz.CATextLayer.layer()
+        self.text.setFontSize_(22)
+        self.text.setAlignmentMode_("center")
+        self.text.setContentsScale_(2.0)
+        self.text.setBounds_(((0, 0), (520, 30)))
+        self.text.setForegroundColor_(AppKit.NSColor.whiteColor().CGColor())
+        self.text.setBackgroundColor_(AppKit.NSColor.colorWithSRGBRed_green_blue_alpha_(0, 0, 0, 0.55).CGColor())
+        self.text.setCornerRadius_(6)
+        root.addSublayer_(self.text)
+        win.orderFrontRegardless()
+        self.win = win
+
+    def show(self, at, progress, label):
+        Q = self.Q
+        Q.CATransaction.begin()
+        Q.CATransaction.setDisableActions_(True)
+        p = (at[0], self.sh - at[1])
+        for layer in (self.ring, self.fill, self.dot):
+            layer.setPosition_(p)
+        k = max(progress, 0.02)
+        self.fill.setTransform_(Q.CATransform3DMakeScale(k, k, 1))
+        self.text.setString_(label)
+        self.text.setPosition_((p[0], p[1] - 80 if at[1] < self.sh / 2 else p[1] + 80))
+        Q.CATransaction.commit()
+        Q.CATransaction.flush()
+
+    def pump(self):
+        app = self.AK.NSApp
+        while True:
+            ev = app.nextEventMatchingMask_untilDate_inMode_dequeue_(self.AK.NSEventMaskAny, None, self.AK.NSDefaultRunLoopMode, True)
+            if ev is None:
+                break
+            app.sendEvent_(ev)
+
+    def close(self):
+        self.win.orderOut_(None)
+        self.win.close()
+
+
 class RelativeMap:
     """Air-mouse style: hand motion moves the cursor by gain × normalised motion."""
 
@@ -733,6 +1038,15 @@ class Cursor:
             return 1728, 1117
         b = self.Q.CGDisplayBounds(self.Q.CGMainDisplayID())
         return int(b.size.width), int(b.size.height)
+
+    def screen_mm(self):
+        """The main display's physical size in mm, or None if it does not say (aim mode's metres to points)."""
+        try:
+            Q = self.Q or __import__("Quartz")
+            s = Q.CGDisplayScreenSize(Q.CGMainDisplayID())
+            return (s.width, s.height) if s.width > 50 and s.height > 50 else None
+        except Exception:
+            return None
 
     def _post(self, kind, x, y, button=0):
         ev = self.Q.CGEventCreateMouseEvent(None, kind, (x, y), button)
@@ -1085,9 +1399,16 @@ def parse_rect(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["abs", "rel", "metric"], default="abs",
+    ap.add_argument("--mode", choices=list(MAPS), default="abs",
                     help="abs: a box of the camera image spans the screen; rel: air mouse; metric: the hand's real "
-                         "position in cm, corrected for its distance from the camera (no parallax), --pad spans the screen")
+                         "position in cm, corrected for its distance from the camera (no parallax), --pad spans the screen; "
+                         "aim: the line from your eye through your index fingertip, followed to the screen (adds the face "
+                         "tracker; calibrate once with --aim-calibrate)")
+    ap.add_argument("--aim-calibrate", action="store_true",
+                    help="aim: start with the five-dot calibration (point at each dot until its disc fills); saved for "
+                         "next time. The control line `calibrate` starts it later")
+    ap.add_argument("--eye", choices=["mid", "left", "right"], default="mid",
+                    help="aim: which eye the ray starts from (mid = between them; the calibration absorbs the dominant eye)")
     ap.add_argument("--pad", type=parse_pair, default=(24.0, 15.0), metavar="W,H",
                     help="metric: centimetres of hand movement that span the screen, across and down")
     ap.add_argument("--keep", type=float, default=0.95,
@@ -1187,9 +1508,19 @@ def main():
     marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
     overlay = Overlay(size=args.ring or 64, enabled=bool(args.ring))
     sw, sh = cursor.screen()
+    if args.aim_calibrate:
+        args.mode = "aim"
+    if args.mode == "aim" and not os.path.exists(FACE_MODEL):
+        sys.exit(f"aim mode needs the face model at {FACE_MODEL} (run setup.sh)")
+
     def make_mapper(mode):
         if mode == "metric":
             return MetricMap(sw, sh, (args.pad[0] / 100, args.pad[1] / 100), keep=args.keep)
+        if mode == "aim":
+            cal = load_aim_cal(sw, sh)
+            note = "calibrated" if cal else "not calibrated yet: the control line `calibrate` starts it"
+            print(f"I,aim,{note}", file=sys.stderr, flush=True)
+            return AimMap(sw, sh, cursor.screen_mm(), eye=args.eye, cal=cal)
         if mode == "abs":
             return AbsoluteMap(sw, sh, args.box, args.rect)
         return RelativeMap(sw, sh, args.gain)
@@ -1242,8 +1573,18 @@ def main():
                         precision.reset()
                     elif parts[:1] == ["median"] and len(parts) == 2:
                         despike.n = max(1, int(parts[1]))
-                    elif parts[:1] == ["map"] and len(parts) == 2 and parts[1] in ("abs", "metric", "rel"):
+                    elif parts[:1] == ["map"] and len(parts) == 2 and parts[1] in MAPS:
+                        if parts[1] == "aim" and not os.path.exists(FACE_MODEL):
+                            raise ValueError(f"no face model at {FACE_MODEL} (run setup.sh)")
                         nonlocal_state["mapper"] = parts[1]
+                    elif parts[:1] == ["calibrate"] and len(parts) == 1:
+                        if not os.path.exists(FACE_MODEL):
+                            raise ValueError(f"no face model at {FACE_MODEL} (run setup.sh)")
+                        nonlocal_state["calibrate"] = True
+                    elif parts[:1] == ["eye"] and len(parts) == 2 and parts[1] in ("mid", "left", "right"):
+                        args.eye = parts[1]
+                        if isinstance(mapper, AimMap):
+                            mapper.eye, mapper.face_t = parts[1], None
                     elif parts[:1] == ["pad"] and len(parts) == 3:
                         args.pad = (float(parts[1]), float(parts[2]))
                         nonlocal_state["pad"] = True
@@ -1290,6 +1631,11 @@ def main():
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
     calibrating = args.mode == "abs" and args.calibrate > 0
     cal_pts, cal_until = [], None
+    facer = None                  # aim mode: the face landmarker, made the first time it is needed
+    aimcal = dots = None          # aim mode: the five-dot calibration and its dot while it runs
+    face_ms, face_seen, face_frames, aim_report = [], 0, 0, 0.0
+    if args.aim_calibrate:
+        nonlocal_state["calibrate"] = True
 
     def open_camera():
         c = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
@@ -1322,6 +1668,11 @@ def main():
         min_tracking_confidence=args.tracking,
     )
     landmarker = vision.HandLandmarker.create_from_options(opts)
+
+    def make_facer():
+        return vision.FaceLandmarker.create_from_options(vision.FaceLandmarkerOptions(
+            base_options=mpt.BaseOptions(model_asset_path=FACE_MODEL, delegate=mpt.BaseOptions.Delegate.CPU),
+            running_mode=vision.RunningMode.VIDEO, num_faces=1))
     frames_out = FrameWriter(args.frames, cw, ch) if args.frames else None
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
@@ -1348,11 +1699,32 @@ def main():
             t_loop = time.perf_counter()
             if nonlocal_state:
                 want = nonlocal_state.pop("mapper", None)
+                if nonlocal_state.pop("calibrate", None):
+                    want = "aim"
+                    if aimcal is None:
+                        aimcal = AimCalibration(sw, sh)
+                        dots = dots or AimDots()
+                        lock.reset()
+                        r = grab.end()
+                        if r:
+                            cursor.release(r[1], r[2])
+                            cursor.warp(r[3], r[4])
+                        overlay.update(None, visible=False)
+                        print("I,aimcal,start,point at each dot until its disc fills", file=sys.stderr, flush=True)
                 if want and want != args.mode:
                     args.mode = want
                     mapper = make_mapper(want)
                     fx.reset(); fy.reset(); despike.reset(); lock.reset(); precision.reset()
                     last_raw = None
+                if aimcal is not None and not isinstance(mapper, AimMap):   # switched away mid-calibration
+                    print(f"I,aimcal,cancelled,map {args.mode}", file=sys.stderr, flush=True)
+                    aimcal = None
+                    dots.close()
+                    dots = None
+                if isinstance(mapper, AimMap) and nonlocal_state.pop("recenter", None):
+                    mapper.recenter_next = True
+                    lock.reset()
+                    sound.play("Glass")
                 if nonlocal_state.pop("pad", None) and isinstance(mapper, MetricMap):
                     mapper.pad = (args.pad[0] / 100, args.pad[1] / 100)
                 ring = nonlocal_state.pop("ring", None)
@@ -1414,14 +1786,14 @@ def main():
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_last.jpg"), last_hand_frame)
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_lost.jpg"), frame)
                     last_hand_frame, dumps = None, dumps + 1
-            raw = pos = q = free = smooth = None
+            raw = pos = q = free = smooth = aim_hit_now = None
             nx = ny = None
             ratio = dist = opened = float("nan")
             event = None
             if hand:
                 hands += 1
                 lm = [(p.x, p.y, p.z) for p in res.hand_landmarks[0]]
-                nx, ny = point_of(lm, args.point)
+                nx, ny = point_of(lm, "tip" if isinstance(mapper, AimMap) else args.point)   # aim: the ray runs through the tip
                 ratio = pinch_ratio(lm)
                 if res.hand_world_landmarks:
                     dist = pinch_dist([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
@@ -1440,10 +1812,18 @@ def main():
                             print("I,calibration sweep too small; keeping the default box", file=sys.stderr, flush=True)
                         sound.play("Glass")
                         calibrating = False
+                elif aimcal is not None:
+                    # calibrating aim: the cursor stays put; only the uncalibrated hit is collected (below)
+                    wlm = [(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]] if res.hand_world_landmarks else None
+                    mapper(lm, wlm, cw, ch)
+                    aim_hit_now = mapper.hit
                 else:
                     if isinstance(mapper, MetricMap):
                         wlm = [(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]] if res.hand_world_landmarks else None
                         raw = mapper(nx, ny, lm, wlm, cw, ch) or last_raw or (sw / 2, sh / 2)
+                    elif isinstance(mapper, AimMap):
+                        wlm = [(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]] if res.hand_world_landmarks else None
+                        raw = mapper(lm, wlm, cw, ch) or last_raw or (sw / 2, sh / 2)
                     else:
                         raw = mapper(nx, ny)
                     last_raw = raw
@@ -1551,10 +1931,42 @@ def main():
                 held_was = False
                 hover = None
                 overlay.update(None, visible=False)             # the ring vanishing says "hand lost"
+            if aimcal is not None:
+                ev = aimcal.feed(t_det, aim_hit_now)
+                n = len(aimcal.got) + aimcal.skipped
+                if ev == "captured":
+                    h = aimcal.got[-1][1]
+                    print(f"I,aimcal,dot {n},captured,{h[0] * 100:.1f}cm,{h[1] * 100:.1f}cm", file=sys.stderr, flush=True)
+                    sound.play("Tink")
+                elif ev == "skipped":
+                    print(f"I,aimcal,dot {n},skipped,no steady aim in {aimcal.timeout:g} s", file=sys.stderr, flush=True)
+                    sound.play("Basso")
+                if aimcal.done:
+                    fit, why = aimcal.fit(mapper.physical)
+                    if fit:
+                        mapper.map, mapper.calibrated = fit["map"], True
+                        save_aim_cal(sw, sh, fit, args.eye)
+                        misses = " ".join(str(d[2]) for d in fit["dots"])
+                        print(f"I,aimcal,done,rms {fit['rms']:.0f} px,misses px {misses},saved {AIM_CAL_PATH}",
+                              file=sys.stderr, flush=True)
+                        sound.play("Glass")
+                    else:
+                        print(f"I,aimcal,failed,{why},keeping the previous map", file=sys.stderr, flush=True)
+                        sound.play("Basso")
+                    aimcal = None
+                    dots.close()
+                    dots = None
+                    fx.reset(); fy.reset(); despike.reset(); precision.reset(); lock.reset()
+                    last_raw = None
+                else:
+                    dots.show(aimcal.current, aimcal.progress, f"point at the dot   {aimcal.i + 1} of {len(aimcal.dots)}")
             if frames_out and pending_frame:
                 # written after this frame's grab handling, so the engine sees a released grab on the release frame
                 grab_state = "active" if grab.active else ("pending" if (grab.at is not None and grab.allowed) else None)
-                frames_out.write(*pending_frame, extra={"grab": grab_state} if grab_state else None)
+                extra = {"grab": grab_state} if grab_state else {}
+                if isinstance(mapper, AimMap) and mapper.eyes:
+                    extra["eyes"] = [[round(v, 4) for v in e] for e in mapper.eyes]   # aim replays need the eyes too
+                frames_out.write(*pending_frame, extra=extra or None)
                 pending_frame = None
             t_post = time.perf_counter()
             loop_ms.append((t_post - t_loop) * 1000)
@@ -1577,6 +1989,11 @@ def main():
                     pkt["pad"] = [round(mapper.pad[0] * 100, 1), round(mapper.pad[1] * 100, 1)]
                     pkt["dist_cm"] = None if not mapper.s else round(f_px * (cw / 1280) / mapper.s * 100, 1)
                     pkt["px_per_m"] = None if not mapper.s else round(mapper.s, 1)
+                if isinstance(mapper, AimMap):
+                    c3 = lambda p: None if p is None else [round(v * 100, 1) for v in p]  # noqa: E731
+                    pkt["aim"] = {"eye_cm": c3(mapper.E), "tip_cm": c3(mapper.F), "hit_cm": c3(mapper.hit),
+                                  "face": bool(mapper.eyes), "calibrated": mapper.calibrated,
+                                  "calibrating": aimcal is not None}
                 try:
                     diag.sendto(_json.dumps(pkt, separators=(",", ":")).encode(), ("127.0.0.1", args.diag))
                 except OSError:
@@ -1592,6 +2009,13 @@ def main():
                 for lm in (res.hand_landmarks or []):
                     for p in lm:
                         cv2.circle(frame, (int(p.x * fw), int(p.y * fh)), 3, (0, 255, 0), -1)
+                if isinstance(mapper, AimMap):
+                    for e in (mapper.eyes or ()):
+                        cv2.circle(frame, (int(e[0] * fw), int(e[1] * fh)), 5, (255, 255, 0), -1)
+                    if mapper.eye_px and res.hand_landmarks:   # the aiming line, eye to fingertip
+                        tip = res.hand_landmarks[0][INDEX_TIP]
+                        cv2.line(frame, (int(mapper.eye_px[0] * fw / cw), int(mapper.eye_px[1] * fh / ch)),
+                                 (int(tip.x * fw), int(tip.y * fh)), (0, 255, 255), 2)
                 disp = cv2.flip(frame, 1)
                 if isinstance(mapper, AbsoluteMap):
                     x0, y0, x1, y1 = mapper.rect
@@ -1607,10 +2031,18 @@ def main():
                     # the MacBook camera's field of view is ~70 degrees across: f = (w/2) / tan(35 deg)
                     d = mapper.distance((cw / 2) / math.tan(math.radians(35)))
                     stats += f"   hand ~{d * 100:.0f} cm away"
+                if isinstance(mapper, AimMap):
+                    if mapper.E and mapper.F:
+                        stats += f"   eye ~{mapper.E[2] * 100:.0f} cm, fingertip ~{mapper.F[2] * 100:.0f} cm from the screen"
+                    if face_ms:
+                        stats += f"   face {face_ms[-1]:.1f} ms"
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fcol, 1)
                 on = f" on {probe.label()}" if (probe and lock.frame is not None) else ""
                 label = "CALIBRATING: sweep your range" if calibrating else (
+                    f"AIM CALIBRATION: point at dot {aimcal.i + 1} of {len(aimcal.dots)}" if aimcal is not None else (
+                        ("NO FACE: eye held" if mapper.eye_px else "NO FACE YET")
+                        if isinstance(mapper, AimMap) and not mapper.eyes else "")) or (
                     "HANDS OFF: say \"hands on\"" if not cursor.enabled else (
                         f"GRAB: {grab.dx:+.0f}, {grab.dy:+.0f} px" if grab.active else (
                             "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else ""))))
@@ -1624,6 +2056,30 @@ def main():
                     break                       # driven by the gesture program (--control), keys typed into the preview never quit it (found live)
             elif overlay.win is not None:
                 overlay.pump()                  # no preview window runs AppKit's events: do it here
+            elif dots is not None:
+                dots.pump()
+            if isinstance(mapper, AimMap):
+                # the face runs after the cursor has moved, in the time read() would spend waiting for the next frame:
+                # the eye used is one frame old, which a head (moving slowly) never notices, and the cursor gains nothing
+                # in latency from the face tracker
+                if facer is None:
+                    facer = make_facer()
+                t_fc = time.perf_counter()
+                fres = facer.detect_for_video(img, int((t_frame - t0) * 1000))
+                face_ms.append((time.perf_counter() - t_fc) * 1000)
+                slow.append(("face", face_ms[-1] / 1000))
+                face = [(p.x, p.y, p.z) for p in fres.face_landmarks[0]] if fres.face_landmarks else None
+                mapper.see_face(face, cw, ch, t_det)
+                face_frames += 1
+                face_seen += face is not None
+                if t_det - aim_report >= 5.0:
+                    if aim_report:
+                        E, F = mapper.E, mapper.F
+                        where = (f",eye {E[2] * 100:.0f} cm,fingertip {F[2] * 100:.0f} cm from the screen"
+                                 if (E and F) else "")
+                        print(f"I,aim,face {100 * face_seen / max(face_frames, 1):.0f}%,face ms p50 "
+                              f"{percentile(face_ms, .5):.1f}{where}", file=sys.stderr, flush=True)
+                    face_ms, face_seen, face_frames, aim_report = face_ms[-1:], 0, 0, t_det
             worst = max(slow, key=lambda x: x[1])
             if worst[1] > 0.08:                 # name any stall, so a hitch is never a mystery (found live: 250-500 ms)
                 print(f"I,slow,{worst[0]},{worst[1] * 1000:.0f}ms", file=sys.stderr, flush=True)

@@ -419,5 +419,136 @@ fw.close()
 recs = [_json.loads(x) for x in buf.getvalue().splitlines()]
 check(recs[0].get("grab") == "active" and "grab" not in recs[1], f"extra fields ride on the frame ({[r.get('grab') for r in recs]})")
 
+# --- aim: the ray from the eye through the fingertip, followed to the screen ---
+from bench import (AIM_DOTS, AimCalibration, AimMap, aim_hit, back_project, eye_centres, EYE_CORNERS,  # noqa: E402
+                   IPD_M)
+check(close(aim_hit((0.0, 0.05, 0.6), (0.1, 0.1, 0.3)), (0.2, 0.15)), "a fingertip halfway to the screen doubles the offset")
+check(aim_hit((0.0, 0.0, 0.3), (0.0, 0.0, 0.28)) is None, "a fingertip less than 5 cm in front of the eye aims nowhere")
+check(aim_hit((0.0, 0.0, 0.3), (0.0, 0.0, 0.4)) is None, "a fingertip behind the eye aims nowhere")
+check(back_project(700, 360, 0.5, 1280, 720, 914)[0] < 0, "right of the image centre is the user's left (the camera faces them)")
+
+CW, CH, SW, SH, MM = 1280, 720, 1728, 1117, (345.0, 223.0)
+F_PX = (CW / 2) / math.tan(math.radians(35))
+HAND = [(0.03 * math.cos(k), 0.03 * math.sin(k), 0.0) for k in range(21)]   # any shape with some spread; tip replaced
+HAND[INDEX_TIP] = (0.0, -0.06, -0.05)                                    # the tip 5 cm nearer the camera than the rest
+MZ = sum(p[2] for p in HAND) / 21
+
+
+def project(P):
+    return (CW / 2 - P[0] * F_PX / P[2], CH / 2 + P[1] * F_PX / P[2])
+
+
+def scene(eye, target, tip_z, ipd=IPD_M):
+    """Face and hand landmarks for an eye at `eye` aiming at screen point `target` (X, Y m) with the fingertip
+    `tip_z` m from the screen. The eyes are `ipd` apart; the hand is drawn with the weak perspective the tracker
+    assumes, sized so its tip lands where the ray passes at that depth."""
+    face = [(0.5, 0.5, 0.0)] * 478
+    for (a, b), dx in zip(EYE_CORNERS, (-ipd / 2, ipd / 2)):
+        u, v = project((eye[0] + dx, eye[1], eye[2]))
+        face[a] = ((u - 12) / CW, v / CH, 0.0)
+        face[b] = ((u + 12) / CW, v / CH, 0.0)
+    lam = (eye[2] - tip_z) / eye[2]
+    P = tuple(eye[k] + ((target[0], target[1], 0.0)[k] - eye[k]) * lam for k in range(3))
+    ut, vt = project(P)
+    zc = P[2] - (HAND[INDEX_TIP][2] - MZ)
+    s = F_PX / zc
+    img = [((ut + s * (w[0] - HAND[INDEX_TIP][0])) / CW, (vt + s * (w[1] - HAND[INDEX_TIP][1])) / CH, 0.0) for w in HAND]
+    return face, img, list(HAND)
+
+
+def aim_at(m, eye, target, tip_z, ipd=IPD_M, frames=60):
+    face, img, world = scene(eye, target, tip_z, ipd)
+    out = None
+    for i in range(frames):
+        m.see_face(face, CW, CH, i / 30)
+        out = m(img, world, CW, CH)
+    return out
+
+
+check(eye_centres([(0.6, 0.4, 0.0)] * 478)[0][0] == 0.6, "eye centres are the middles of their corners")
+m = AimMap(SW, SH, MM)
+eye = (0.02, -0.04, 0.55)
+for target in ((0.0, 0.05), (-0.12, 0.02), (0.14, 0.19)):
+    got = aim_at(m, eye, target, 0.3)
+    want = (target[0] * SW / 0.345 + SW / 2, target[1] * SH / 0.223)
+    check(m.hit is not None and close(m.hit, target, 1e-3), f"the ray hits the aimed spot {target} ({m.hit})")
+    check(got is not None and close(got, want, 1.0), f"the hit becomes the right screen point ({got} vs {want})")
+check(aim_at(AimMap(SW, SH, MM), eye, (0.0, 0.1), 0.52) is None, "no aim while the fingertip is at the eye")
+m = AimMap(SW, SH, MM)
+check(m(scene(eye, (0, 0.1), 0.3)[1], HAND, CW, CH) is None, "no aim before the face has been seen")
+m = AimMap(SW, SH, MM)
+aim_at(m, eye, (0.0, 0.1), 0.3)
+m.see_face(None, CW, CH, 3.0)
+check(m(scene(eye, (0.05, 0.1), 0.3)[1], HAND, CW, CH) is not None, "a face out of view keeps the last eye")
+m = AimMap(SW, SH, MM)
+aim_at(m, eye, (0.05, 0.08), 0.3)
+m.recenter_next = True
+check(close(aim_at(m, eye, (0.05, 0.08), 0.3, frames=1), (SW / 2, SH / 2), 1.0), "recenter: where you aim becomes the centre")
+
+
+def run_calibration(ipd, eye_at, noise=0.0, seed=3):
+    """Calibrate a simulated user (eyes `ipd` apart) by pointing at the five dots, 30 frames each after settling."""
+    random.seed(seed)
+    m, cal, t = AimMap(SW, SH, MM), AimCalibration(SW, SH), 0.0
+    for (fx_, fy_) in AIM_DOTS:
+        target = ((fx_ * SW - SW / 2) * 0.345 / SW, fy_ * SH * 0.223 / SH)
+        face, img, world = scene(eye_at, target, 0.3, ipd)
+        for i in range(90):
+            t += 1 / 30
+            jit = [(p[0] + random.gauss(0, noise) / CW, p[1] + random.gauss(0, noise) / CH, p[2]) for p in img]
+            m.see_face(face, CW, CH, t)
+            m(jit, world, CW, CH)
+            if cal.feed(t, m.hit) == "captured":
+                break
+    return m, cal
+
+
+def miss_after(m, ipd, eye_at):
+    """Worst screen miss (points) over a 3x3 grid of targets, including ones the calibration never saw."""
+    worst = 0.0
+    for fx_ in (0.1, 0.5, 0.9):
+        for fy_ in (0.1, 0.5, 0.9):
+            target = ((fx_ - 0.5) * 0.345, fy_ * 0.223)
+            got = aim_at(m, eye_at, target, 0.3, ipd, frames=40)
+            worst = max(worst, math.hypot(got[0] - fx_ * SW, got[1] - fy_ * SH))
+    return worst
+
+
+small_eyes = 0.057                                   # 6 mm under the assumed spacing
+m, cal = run_calibration(small_eyes, eye)
+check(cal.done and len(cal.got) == 5 and cal.skipped == 0, f"a steady user captures all five dots ({len(cal.got)}, {cal.skipped} skipped)")
+before = miss_after(AimMap(SW, SH, MM), small_eyes, eye)
+fit, why = cal.fit(m.physical)
+check(fit is not None, f"the calibration fits ({why})")
+m.map = fit["map"]
+after = miss_after(m, small_eyes, eye)
+check(after < before / 3 and after < 25, f"calibration absorbs a different eye spacing (worst miss {before:.0f} -> {after:.0f} pt)")
+check(miss_after(m, small_eyes, (0.06, -0.02, 0.60)) < 60,
+      f"a head moved 4 cm sideways and 5 cm back still aims close ({miss_after(m, small_eyes, (0.06, -0.02, 0.60)):.0f} pt)")
+m, cal = run_calibration(IPD_M, eye, noise=1.5)
+fit, _ = cal.fit(m.physical)
+check(fit is not None and cal.skipped == 0, "a hand jittering 1.5 px still calibrates")
+
+import tempfile  # noqa: E402
+from bench import load_aim_cal, save_aim_cal  # noqa: E402
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "sub", "aim.json")
+    save_aim_cal(SW, SH, fit, "mid", path=path)
+    check(close(load_aim_cal(SW, SH, path=path), fit["map"]), "a saved calibration loads back")
+    check(load_aim_cal(1440, 900, path=path) is None, "a calibration for another display size is not used")
+    check(load_aim_cal(SW, SH, path=os.path.join(tmp, "none.json")) is None, "no file, no calibration")
+
+cal = AimCalibration(SW, SH, timeout=3.0)
+events = [cal.feed(k / 30, (0.01 * math.sin(k), 0.0)) for k in range(100)]   # sweeping +-1 cm... steady enough
+check("captured" in events, "a hand within the spread is captured")
+cal = AimCalibration(SW, SH, timeout=3.0)
+events = [cal.feed(k / 30, (0.2 * math.sin(k / 3), 0.0)) for k in range(100)]   # waving 20 cm
+check("captured" not in events and events.count("skipped") == 1, f"a waving hand is never captured; the dot is skipped")
+check(cal.i == 1 and cal.progress == 0.0, "after a skip the next dot is up")
+cal = AimCalibration(SW, SH)
+cal.got = [((0, 0), (0, 0)), ((100, 0), (0.001, 0.0)), ((0, 100), (0.0, 0.001))]
+fit, why = cal.fit((5000, 864, 5000, 0))
+check(fit is None and "scale" in why, f"a scale far from the display's is refused ({why})")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

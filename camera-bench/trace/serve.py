@@ -76,10 +76,18 @@ class Handler(http.server.SimpleHTTPRequestHandler):
         except json.JSONDecodeError:
             self.send_error(400)
             return
+        try:                                    # the tracker's settings when the task ended, so modes can be compared
+            pkt = json.loads(latest["data"])
+            rec["pointer"] = {k: pkt.get(k) for k in ("mode", "point", "precision")}
+            if pkt.get("aim"):
+                rec["pointer"]["aim_calibrated"] = pkt["aim"].get("calibrated")
+        except (ValueError, AttributeError):
+            pass
         LOG.parent.mkdir(parents=True, exist_ok=True)
         with open(LOG, "a") as f:
             f.write(json.dumps(rec) + "\n")
-        print(f"result: {rec.get('task')}: off path {rec.get('rms')} px rms, max {rec.get('max')}, jitter {rec.get('jitter')}", flush=True)
+        mode = (rec.get("pointer") or {}).get("mode") or "?"
+        print(f"result ({mode}): {rec.get('task')}: off path {rec.get('rms')} px rms, max {rec.get('max')}, jitter {rec.get('jitter')}", flush=True)
         self.send_response(204)
         self.end_headers()
 
