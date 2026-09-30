@@ -147,13 +147,28 @@ lm = list(lm)
 lm[3] = (0.40, 0.60, 0.0)          # thumb IP
 lm[8] = (0.55, 0.30, 0.0)          # index tip
 lm[2], lm[5] = (0.38, 0.70, 0.0), (0.50, 0.55, 0.0)
-check(point_of(lm, "thumb") == (0.40, 0.60), "thumb = the thumb's middle joint")
+check(point_of(lm, "thumbip") == (0.40, 0.60), "thumbip = the thumb's middle joint")
+tx, ty = point_of(lm, "thumb")
+check(abs(tx - (0.38 + 0.40 + 0.50) / 3) < 1e-9 and abs(ty - (0.70 + 0.60 + 0.55) / 3) < 1e-9,
+      "thumb = mean of thumb base, thumb middle joint and index knuckle")
 check(point_of(lm, "tip") == (0.55, 0.30), "tip = the index fingertip")
 check(point_of(lm, "web") == (0.44, 0.625), "web = between thumb base and index knuckle")
 curled = list(lm)
 curled[8] = (0.45, 0.55, 0.0)      # the index curls toward the thumb
 check(point_of(curled, "thumb") == point_of(lm, "thumb"), "curling the index does not move the thumb anchor")
-check(set(POINTS) == {"tip", "thumb", "thumbtip", "web", "palm"}, "all anchor names are known")
+check(set(POINTS) == {"tip", "thumb", "thumbip", "thumbtip", "web", "palm"}, "all anchor names are known")
+
+# --- despike: a single-frame glitch never reaches the cursor; n=1 passes everything ---
+from bench import Despike, Rate  # noqa: E402
+d = Despike(3)
+outs = [d(p) for p in [(100, 100), (102, 101), (400, 90), (104, 102), (106, 103)]]
+check(all(abs(o[0] - 103) < 5 for o in outs[2:]), f"a one-frame jump to x=400 is dropped ({outs})")
+d = Despike(1)
+check(d((400, 90)) == (400, 90), "median 1 is off")
+r = Rate()
+for i in range(60):
+    fps = r.tick(i / 30)
+check(abs(fps - 30) < 0.5, f"frame rate reads 30 at 30 fps ({fps:.2f})")
 
 # --- hover lock: rest locks, small motion is ignored, a real move breaks out, a grab never breaks ---
 k = Lock(dwell=0.2, still=120, breakout=50)

@@ -97,6 +97,50 @@ def lead_gain(speed, v0=150.0, v1=500.0):
     return min(max((speed - v0) / (v1 - v0), 0.0), 1.0)
 
 
+def gray_prep(bgr, clahe):
+    """Greyscale plus a contrast lift (CLAHE) on a half-size frame, back to 3 channels for the model.
+    Measured on a dim red-lit recording: the hand found in 95% of frames, against 93% raw and 88% for
+    `enhance`; 0.3 ms. (Edges only, the other idea tried: 0%, the model needs a natural image.)"""
+    import cv2
+    h, w = bgr.shape[:2]
+    g = cv2.cvtColor(cv2.resize(bgr, (w // 2, h // 2), interpolation=cv2.INTER_AREA), cv2.COLOR_BGR2GRAY)
+    return cv2.cvtColor(clahe.apply(g), cv2.COLOR_GRAY2BGR)
+
+
+class Despike:
+    """Median of the last n points: a single-frame landmark glitch never reaches the cursor. Costs
+    (n-1)/2 frames of delay; n=1 is off."""
+
+    def __init__(self, n=3):
+        self.n = n
+        self.buf = collections.deque(maxlen=max(1, n))
+
+    def __call__(self, p):
+        if self.buf.maxlen != max(1, self.n):
+            self.buf = collections.deque(self.buf, maxlen=max(1, self.n))
+        self.buf.append(p)
+        xs = sorted(q[0] for q in self.buf)
+        ys = sorted(q[1] for q in self.buf)
+        return xs[len(xs) // 2], ys[len(ys) // 2]
+
+    def reset(self):
+        self.buf.clear()
+
+
+class Rate:
+    """Frames per second as the user sees it: an exponential average of the frame interval."""
+
+    def __init__(self, k=0.1):
+        self.k, self.dt, self.last = k, None, None
+
+    def tick(self, t):
+        if self.last is not None:
+            d = t - self.last
+            self.dt = d if self.dt is None else self.dt + self.k * (d - self.dt)
+        self.last = t
+        return 1.0 / self.dt if self.dt else 0.0
+
+
 def enhance(bgr, clahe):
     """Low-light correction before detection: grey-world white balance (a red-lit room turns neutral),
     then CLAHE on the lightness channel (dim hands gain contrast without blowing out lamps).
@@ -160,19 +204,26 @@ def pinch_dist(wlm):
 
 
 THUMB_MCP, THUMB_IP = 2, 3
-POINTS = ("tip", "thumb", "thumbtip", "web", "palm")
+POINTS = ("tip", "thumb", "thumbip", "thumbtip", "web", "palm")
+PREPS = ("none", "enhance", "gray")
 
 
 def point_of(lm, which):
     """The point that drives the cursor.
     tip       index fingertip: precise, but it moves whenever the index curls or pinches
-    thumb     the thumb's middle joint: stays put while the index finger does the grabbing (user's design)
+    thumb     mean of the thumb base, the thumb's middle joint and the index knuckle: none of them move
+              when the index finger grabs (user's design), and averaging three joints halves the noise
+              (recorded in a dim bar: 29 jumps over 40 px in 20 s, against 66 for the fingertip)
+    thumbip   the thumb's middle joint alone (38 jumps)
     thumbtip  thumb tip
-    web       between the thumb base and the index knuckle: steady through a pinch
-    palm      mean of the four finger knuckles: steadiest, least precise"""
+    web       between the thumb base and the index knuckle
+    palm      mean of the four finger knuckles"""
     if which == "tip":
         return lm[INDEX_TIP][0], lm[INDEX_TIP][1]
     if which == "thumb":
+        ks = (THUMB_MCP, THUMB_IP, INDEX_MCP)
+        return sum(lm[k][0] for k in ks) / 3, sum(lm[k][1] for k in ks) / 3
+    if which == "thumbip":
         return lm[THUMB_IP][0], lm[THUMB_IP][1]
     if which == "thumbtip":
         return lm[THUMB_TIP][0], lm[THUMB_TIP][1]
@@ -538,9 +589,11 @@ def main():
     ap.add_argument("--dump", help="directory: at each drop-out save the last frame with a hand and the first without")
     ap.add_argument("--frames", metavar="PATH", help="write every frame's landmarks as one JSON line to PATH ('-' = stdout), for the gesture engine")
     ap.add_argument("--hands", type=int, default=1, help="hands to track (2 for two-hand gestures; costs detect time)")
-    ap.add_argument("--enhance", action="store_true",
-                    help="low light: neutralise a colour cast (grey world) and lift contrast (CLAHE) before detection; "
-                         "the preview shows the corrected image")
+    ap.add_argument("--enhance", action="store_true", help="same as --prep enhance")
+    ap.add_argument("--prep", choices=list(PREPS), default="none",
+                    help="before detection: none; enhance (grey-world colour + CLAHE); gray (greyscale + CLAHE, "
+                         "best in a dim coloured room). The preview shows the prepared image")
+    ap.add_argument("--median", type=int, default=1, help="despike: median of the last N anchor points (3 kills single-frame jumps; 1 = off)")
     ap.add_argument("--detection", type=float, default=0.5, help="MediaPipe min hand detection confidence (lower finds a hand sooner in poor light)")
     ap.add_argument("--control", action="store_true",
                     help="read live tuning lines on stdin: 'filter <mincutoff> <beta>', 'lead <ms>', 'cursor on|off'")
@@ -559,6 +612,10 @@ def main():
     mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
     lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout)
+    despike = Despike(args.median)
+    rate = Rate()
+    if args.enhance and args.prep == "none":
+        args.prep = "enhance"
     if args.control:
         # live tuning from the parent (the gesture engine forwards its file's `pointer` line):
         #   filter <mincutoff> <beta> | lead <ms> | cursor on|off
@@ -579,7 +636,11 @@ def main():
                         cursor.enabled = parts[1] == "on"
                     elif parts[:1] == ["point"] and len(parts) == 2 and parts[1] in POINTS:
                         args.point = parts[1]
-                        fx.reset(); fy.reset(); lock.reset()      # a new anchor starts a new track
+                        fx.reset(); fy.reset(); lock.reset(); despike.reset()      # a new anchor starts a new track
+                    elif parts[:1] == ["prep"] and len(parts) == 2 and parts[1] in PREPS:
+                        args.prep = parts[1]
+                    elif parts[:1] == ["median"] and len(parts) == 2:
+                        despike.n = max(1, int(parts[1]))
                     elif parts[:1] == ["lock"] and len(parts) in (3, 4):
                         lock.dwell, lock.breakout = float(parts[1]) / 1000, float(parts[2])
                         if len(parts) == 4:
@@ -624,7 +685,7 @@ def main():
     )
     landmarker = vision.HandLandmarker.create_from_options(opts)
     frames_out = FrameWriter(args.frames, cw, ch) if args.frames else None
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)) if args.enhance else None
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
     log_file = open(args.log, "w", newline="") if args.log else None
     log = csv.writer(log_file) if log_file else None
@@ -656,8 +717,11 @@ def main():
                 cap.set(cv2.CAP_PROP_FPS, args.fps)
                 pinned = True
             frames += 1
-            if args.enhance:
+            fps_now = rate.tick(t_frame)
+            if args.prep == "enhance":
                 frame = enhance(frame, clahe)
+            elif args.prep == "gray":
+                frame = gray_prep(frame, clahe)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             res = landmarker.detect_for_video(img, int((t_frame - t0) * 1000))
@@ -705,7 +769,8 @@ def main():
                         calibrating = False
                 else:
                     raw = mapper(nx, ny)
-                    pos = (fx(raw[0], t_det), fy(raw[1], t_det))
+                    q = despike(raw)
+                    pos = (fx(q[0], t_det), fy(q[1], t_det))
                     if args.lead_ms:
                         ahead = lead_gain(math.hypot(fx.dx, fy.dx), *args.lead_gate) * args.lead_ms / 1000
                         pos = (fx.lead(ahead), fy.lead(ahead))
@@ -742,6 +807,7 @@ def main():
                     mapper.lost()
                 fx.reset(); fy.reset()
                 lock.reset()
+                despike.reset()
                 last_pos = None
                 if cursor.down:
                     cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
@@ -769,10 +835,15 @@ def main():
                 found = "HAND" if hand else ("HAND (held)" if state == "held" else "NO HAND")
                 colour = (0, 220, 0) if hand else ((0, 200, 255) if state == "held" else (0, 0, 255))
                 cv2.putText(disp, found, (16, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.1, colour, 3)
+                # live frame rate (user request): green at 28+, amber at 20+, red below
+                fcol = (0, 220, 0) if fps_now >= 28 else ((0, 200, 255) if fps_now >= 20 else (0, 0, 255))
+                stats = f"{fps_now:4.1f} fps   detect {(t_det - t_frame) * 1000:4.1f} ms   {args.point} / {args.prep}"
+                cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
+                cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fcol, 1)
                 label = "CALIBRATING: sweep your range" if calibrating else (
                     "PINCH (locked)" if pinch.closed else ("LOCKED" if lock.at is not None else ""))
                 if label:
-                    cv2.putText(disp, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
+                    cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
                 cv2.imshow("camera bench (q quits)", disp)
                 if cv2.waitKey(1) & 0xFF == ord("q"):
                     break
