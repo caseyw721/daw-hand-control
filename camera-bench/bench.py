@@ -686,7 +686,9 @@ AIM_CAL_PATH = os.path.expanduser("~/Library/Application Support/DAW Control/aim
 # the four knuckles) 9 / 43. A finger pointed at the camera is foreshortened and its tip is hard to place; the base
 # moves only with the whole hand, and the calibration absorbs the fixed offset from it to the fingertip. Over the first
 # three good calibration rounds (tools/aim_replay.py, each round tested against a fit of the others) pip missed least:
-# 196 / 370 pt median / p90, base 279 / 429, tip 372 / 1120; so pip is the default.
+# 196 / 370 pt median / p90, base 279 / 429, tip 372 / 1120. Over all 13 rounds of the day (each fitted to itself)
+# the tip with depth smoothing 0.12 fitted best, 123 px (pip 150, base 231), and the user wants the line through the
+# tip ("the tip is where it's actually going to be pointing"): the tip is the default.
 AIM_THROUGH = {"tip": (INDEX_TIP,), "pip": (6,), "base": (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)}
 
 
@@ -785,7 +787,7 @@ class AimMap:
     absorbs the user's own eye spacing and hand size, the dominant eye and the camera's exact place. When the face
     is out of view (the hand between face and camera, pointing near the top-middle) the last eye is kept."""
 
-    def __init__(self, screen_w, screen_h, mm=None, eye="mid", cal=None, hfov=CAMERA_HFOV, through="pip", depth_k=0.02):
+    def __init__(self, screen_w, screen_h, mm=None, eye="mid", cal=None, hfov=CAMERA_HFOV, through="tip", depth_k=0.12):
         self.w, self.h = screen_w, screen_h
         # per-frame smoothing of the hand's distance. With the eye above the camera, 1 cm of hand depth moves the hit
         # ~0.5 cm, and the measured depth wandered 23-33 cm while the first calibration held each dot: at 0.12 its dots
@@ -865,12 +867,13 @@ class AimMap:
 
 class AimCalibration:
     """Five dots, one at a time (the centre, then the corners 15 % in): point at each until it is captured. A dot is
-    captured once the uncalibrated hit has held within `spread` m (80 % of the samples) for `hold` s (4 cm: at 2 cm the
+    captured once the uncalibrated hit has held within `spread` m (80 % of the samples) for `hold` s (2 s to get there and a
+    1.5 s hold: at 0.8 s and 1 s it caught a hand still on its way, user, live: "I'm not pointing at it ... chill"; 4 cm: at 2 cm the
     first live try captured 1 of 5, the hit of a held hand wobbling 2-10 cm at 70-120 cm from the screen), counted from
     `settle` s after the dot appeared (time to get there); a dot not captured in `timeout` s is skipped. fit() gives
     the scale and offset each way (least squares) and the rms miss in points."""
 
-    def __init__(self, sw, sh, dots=AIM_DOTS, settle=0.8, hold=1.0, spread=0.04, timeout=12.0, min_move=0.02):
+    def __init__(self, sw, sh, dots=AIM_DOTS, settle=2.0, hold=1.5, spread=0.04, timeout=15.0, min_move=0.02):
         self.sw, self.sh = sw, sh
         self.dots = [(fx * sw, fy * sh) for fx, fy in dots]
         self.settle, self.hold, self.spread, self.timeout = settle, hold, spread, timeout
@@ -1470,7 +1473,9 @@ def main():
     ap.add_argument("--aim-calibrate", action="store_true",
                     help="aim: start with the five-dot calibration (point at each dot until its disc fills); saved for "
                          "next time. The control line `calibrate` starts it later")
-    ap.add_argument("--aim-through", choices=["base", "pip", "tip"], default="pip",
+    ap.add_argument("--aim-depth", type=float, default=0.12,
+                    help="aim: per-frame smoothing of the hand's distance (0.12; 0.02 is slower and steadier)")
+    ap.add_argument("--aim-through", choices=["base", "pip", "tip"], default="tip",
                     help="aim: the hand point the ray passes through: pip (the index finger's middle joint: 2x steadier than "
                          "the tip and the best calibrations, measured live), base (wrist and knuckles, steadiest, follows "
                          "finger aiming less) or tip (the fingertip itself)")
@@ -1587,7 +1592,8 @@ def main():
             cal = load_aim_cal(sw, sh)
             note = "calibrated" if cal else "not calibrated yet: the control line `calibrate` starts it"
             print(f"I,aim,{note}", file=sys.stderr, flush=True)
-            return AimMap(sw, sh, cursor.screen_mm(), eye=args.eye, cal=cal, through=args.aim_through)
+            return AimMap(sw, sh, cursor.screen_mm(), eye=args.eye, cal=cal, through=args.aim_through,
+                          depth_k=args.aim_depth)
         if mode == "abs":
             return AbsoluteMap(sw, sh, args.box, args.rect)
         return RelativeMap(sw, sh, args.gain)
@@ -2018,7 +2024,9 @@ def main():
                 if aimcal.done:
                     own, why = aimcal.fit(mapper.physical)
                     rounds = load_aim_rounds(sw, sh, args.aim_through)
-                    if aimcal.got:
+                    if own and own["rms"] <= POOL_ROUND_MAX_PX:   # a round that moved is never stored: it would push a
+                        # good one out of the recent window (live: 3 of 6 rounds pooled fell to 2; user: "that's a bad
+                        # test, don't use that test")
                         rounds.append([[round(dt[0]), round(dt[1]), round(h[0], 5), round(h[1], 5)] for dt, h in aimcal.got])
                     rounds = rounds[-POOL_ROUNDS:]
                     fit, used, why2 = pool_rounds(rounds, mapper.physical, sw, sh)

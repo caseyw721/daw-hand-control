@@ -25,7 +25,7 @@ import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from bench import (AIM_CAL_PATH, POOL_ROUNDS, AimCalibration, AimMap, EYE_CORNERS, pool_rounds,  # noqa: E402
+from bench import (AIM_CAL_PATH, POOL_ROUNDS, POOL_ROUND_MAX_PX, AimCalibration, AimMap, EYE_CORNERS, pool_rounds,  # noqa: E402
                    save_aim_cal)
 
 W, H, SW, SH, MM = 1280, 720, 1728, 1117, (345.0, 223.0)
@@ -56,10 +56,13 @@ def face_from(eyes):
     return face
 
 
+TIMING = {}   # settle / hold / timeout the rounds were recorded with (set from the command line)
+
+
 def replay_round(frames, t0, through, depth_k):
     """The (dot px, hit m) pairs one calibration round captures with these settings."""
     m = AimMap(SW, SH, MM, through=through, depth_k=depth_k)
-    cal = AimCalibration(SW, SH)
+    cal = AimCalibration(SW, SH, **TIMING)
     for d in frames:
         t = d["t"]
         if d.get("eyes"):
@@ -95,7 +98,12 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("sessions", nargs="*")
     ap.add_argument("--write", metavar="THROUGH,DEPTH")
+    ap.add_argument("--timing", default="0.8,1.0,12", metavar="SETTLE,HOLD,TIMEOUT",
+                    help="the dot timing the rounds were recorded with: they must be replayed with it, or a capture lands "
+                         "while the user is already on the next dot (0.8,1.0,12 until 2026-09-30 14:45, then 2,1.5,15)")
     args = ap.parse_args()
+    st, ho, to = (float(v) for v in args.timing.split(","))
+    TIMING.update(settle=st, hold=ho, timeout=to)
     paths = args.sessions or sorted(glob.glob(os.path.join(SESSIONS, "*.frames.jsonl")))
     rounds = []                       # (session name, frames, start time)
     for p in paths:
@@ -133,8 +141,9 @@ def main():
     if args.write:
         th, dk = args.write.split(",")
         _, _, per = results[(th, float(dk))]
-        rounds = [[[round(dt[0]), round(dt[1]), round(h[0], 5), round(h[1], 5)] for dt, h in g] for g in per if g]
         m = AimMap(SW, SH, MM, through=th)
+        usable = [g for g in per if len(g) >= 3 and (fit(g, m.physical)[0] or {"rms": 1e9})["rms"] <= POOL_ROUND_MAX_PX]
+        rounds = [[[round(dt[0]), round(dt[1]), round(h[0], 5), round(h[1], 5)] for dt, h in g] for g in usable]
         pooled, used, why = pool_rounds(rounds, m.physical, SW, SH)
         if not pooled:
             sys.exit(f"no pooled fit for that setting: {why}")

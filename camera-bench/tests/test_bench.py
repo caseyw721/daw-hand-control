@@ -493,7 +493,7 @@ def run_calibration(ipd, eye_at, noise=0.0, seed=3):
     for (fx_, fy_) in AIM_DOTS:
         target = ((fx_ * SW - SW / 2) * 0.345 / SW, fy_ * SH * 0.223 / SH)
         face, img, world = scene(eye_at, target, 0.3, ipd)
-        for i in range(90):
+        for i in range(150):
             t += 1 / 30
             jit = [(p[0] + random.gauss(0, noise) / CW, p[1] + random.gauss(0, noise) / CH, p[2]) for p in img]
             m.see_face(face, CW, CH, t)
@@ -538,17 +538,17 @@ with tempfile.TemporaryDirectory() as tmp:
     check(load_aim_cal(1440, 900, path=path) is None, "a calibration for another display size is not used")
     check(load_aim_cal(SW, SH, path=os.path.join(tmp, "none.json")) is None, "no file, no calibration")
 
-cal = AimCalibration(SW, SH, timeout=3.0)
-events = [cal.feed(k / 30, (0.01 * math.sin(k), 0.0)) for k in range(100)]   # sweeping +-1 cm... steady enough
+cal = AimCalibration(SW, SH, timeout=6.0)
+events = [cal.feed(k / 30, (0.01 * math.sin(k), 0.0)) for k in range(150)]   # sweeping +-1 cm... steady enough
 check("captured" in events, "a hand within the spread is captured")
-cal = AimCalibration(SW, SH, timeout=3.0)
-events = [cal.feed(k / 30, (0.2 * math.sin(k / 3), 0.0)) for k in range(100)]   # waving 20 cm
+cal = AimCalibration(SW, SH, timeout=4.0)
+events = [cal.feed(k / 30, (0.2 * math.sin(k / 3), 0.0)) for k in range(140)]   # waving 20 cm
 check("captured" not in events and events.count("skipped") == 1, f"a waving hand is never captured; the dot is skipped")
 check(cal.i == 1 and cal.progress == 0.0, "after a skip the next dot is up")
-cal = AimCalibration(SW, SH, timeout=3.0)
+cal = AimCalibration(SW, SH, timeout=4.0)
 events = [cal.feed(k / 30, None) for k in range(300)]                       # ten seconds with no face or hand
 check("skipped" not in events and cal.i == 0, "a dot waits while there is no aim to capture")
-events = [cal.feed(10 + k / 30, (0.0, 0.0)) for k in range(60)]
+events = [cal.feed(10 + k / 30, (0.0, 0.0)) for k in range(120)]
 check("captured" in events, "and is captured once the aim comes back")
 cal = AimCalibration(SW, SH)
 cal.got = [((0, 0), (0, 0)), ((100, 0), (0.001, 0.0)), ((0, 100), (0.0, 0.001))]
@@ -560,7 +560,7 @@ def run_calibration_through(through, ipd, eye_at):
     m, cal, t = AimMap(SW, SH, MM, through=through), AimCalibration(SW, SH), 0.0
     for (fx_, fy_) in AIM_DOTS:
         face, img, world = scene(eye_at, ((fx_ - 0.5) * 0.345, fy_ * 0.223), 0.3, ipd)
-        for i in range(90):
+        for i in range(150):
             t += 1 / 30
             m.see_face(face, CW, CH, t)
             m(img, world, CW, CH)
@@ -575,12 +575,12 @@ check(fit is not None, f"calibrating through the hand's base fits ({why})")
 m.map = fit["map"]
 worst = miss_after(m, IPD_M, eye)
 check(worst < 40, f"through the base, the calibration absorbs the tip-to-base offset (worst miss {worst:.0f} pt)")
-check(AimMap(SW, SH, MM).through == (6,), "the ray runs through the index finger's middle joint by default")
-cal = AimCalibration(SW, SH, timeout=5.0)
-events = [cal.feed(k / 30, (0.0, 0.0)) for k in range(60)]                   # the centre dot, captured
-events = [cal.feed(2 + k / 30, (0.005, 0.0)) for k in range(90)]             # the hand stays where it was
+check(AimMap(SW, SH, MM).through == (INDEX_TIP,), "the ray runs through the index fingertip by default")
+cal = AimCalibration(SW, SH, timeout=8.0)
+events = [cal.feed(k / 30, (0.0, 0.0)) for k in range(120)]                  # the centre dot, captured
+events = [cal.feed(4 + k / 30, (0.005, 0.0)) for k in range(150)]            # the hand stays where it was
 check("captured" not in events and len(cal.got) == 1, "a hand that has not moved on is not captured for the next dot")
-events = [cal.feed(5 + k / 30, (-0.06, -0.03)) for k in range(60)]
+events = [cal.feed(9 + k / 30, (-0.06, -0.03)) for k in range(120)]
 check("captured" in events, "it is once the aim has moved to the new dot")
 
 # pooling: recent rounds fit together, a round that disagrees with itself is left out
