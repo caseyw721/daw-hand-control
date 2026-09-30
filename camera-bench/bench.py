@@ -149,6 +149,66 @@ class Precision:
         return 0.0 if self.at is None else math.hypot(self.last[0] - self.at[0], self.last[1] - self.at[1])
 
 
+class Nudge:
+    """Aim, then fine-tune (user, live 2026-09-30: grabbing a control "without taking 30 seconds"; aim mode lands
+    within ~3 cm, 7 cm at worst). While the hand moves, the cursor is where the aim is. Once the aim has rested (its
+    speed under `still` px/s) for `dwell` s, the cursor lets go of the aim: from then on it moves `gain` of the aim's
+    movement from where it was, so the last few cm are nudged away by a small deliberate move, and the aim's jitter
+    shrinks by the same factor. A quick move (over `snap` px/s for two frames) or the cursor ending up `leash` px from
+    the aim puts it back on the aim. Unlike Precision (always on, so the cursor slid away from where the user
+    pointed: "there's some drift") this only starts on a pause and always snaps back.
+    `freeze`: a pinch or a closing hand moves the fingertip, and with it the aim, without meaning to move the cursor;
+    while one is forming the cursor holds still and nothing snaps, so a grab lands where the nudge put the cursor.
+    Speeds are an average of the last few frames' aim movement (the 1-euro filter's own derivative is low-passed at
+    1 Hz and would notice a quick move 150 ms late). gain 0 or 1 is off."""
+
+    def __init__(self, gain=0.0, dwell=0.3, still=200.0, snap=1200.0, leash=500.0):
+        self.gain, self.dwell, self.still, self.snap, self.leash = gain, dwell, still, snap, leash
+        self.reset()
+
+    def reset(self):
+        self.on = False
+        self.at = self.last = self.t = self.still_since = None
+        self.v = 0.0
+        self.fast = 0
+
+    @property
+    def enabled(self):
+        return 0.0 < self.gain < 1.0
+
+    def __call__(self, aim, t, freeze=False):
+        if not self.enabled:
+            self.reset()
+            return aim
+        if self.last is None or t - self.t > 0.3:          # the first frame, or a gap in the frames: start over
+            self.reset()
+            self.last, self.t = aim, t
+            return aim
+        dx, dy = aim[0] - self.last[0], aim[1] - self.last[1]
+        v = math.hypot(dx, dy) / max(t - self.t, 1e-3)
+        self.v += 0.4 * (v - self.v)
+        self.last, self.t = aim, t
+        if freeze:
+            self.fast, self.still_since = 0, None
+            return self.at if self.on else aim
+        if self.on:
+            self.fast = self.fast + 1 if self.v > self.snap else 0
+            at = (self.at[0] + self.gain * dx, self.at[1] + self.gain * dy)
+            if self.fast >= 2 or math.hypot(aim[0] - at[0], aim[1] - at[1]) > self.leash:
+                self.on, self.at, self.still_since, self.fast = False, None, None, 0
+                return aim
+            self.at = at
+            return at
+        if self.v < self.still:
+            if self.still_since is None:
+                self.still_since = t
+            elif t - self.still_since >= self.dwell:
+                self.on, self.at = True, aim
+        else:
+            self.still_since = None
+        return aim
+
+
 class Despike:
     """Median of the last n points: a single-frame landmark glitch never reaches the cursor. Costs
     (n-1)/2 frames of delay; n=1 is off."""
@@ -308,6 +368,8 @@ def rect_distance(p, frame):
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
+NUDGE_FREEZE_PINCH_M = 0.07   # thumb-to-index distance under which a pinch is forming (pinch closes at 0.035)
+NUDGE_FREEZE_OPEN = 0.85      # openness under which a hand is closing (a grip closes at 0.72)
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
@@ -1233,6 +1295,7 @@ class Overlay:
     could be wider"). Colours: white idle, blue hovered, green locked, amber grabbing."""
 
     IDLE, HOVER, LOCK, GRAB = (1.0, 1.0, 1.0), (0.25, 0.85, 1.0), (0.2, 0.95, 0.55), (1.0, 0.7, 0.15)
+    NUDGE = (0.75, 0.45, 1.0)     # purple: fine-tuning (aim mode, after a pause)
 
     def __init__(self, size=64, enabled=True, pad=14, min_tile=48):
         self.size, self.enabled, self.pad, self.min_tile = size, enabled, pad, min_tile
@@ -1294,11 +1357,11 @@ class Overlay:
         W, H = max(w + 2 * self.pad, self.min_tile), max(h + 2 * self.pad, self.min_tile)
         return (x + w / 2 - W / 2, y + h / 2 - H / 2, W, H)
 
-    def update(self, pos, target=None, locked=False, grabbing=False, visible=True):
+    def update(self, pos, target=None, locked=False, grabbing=False, visible=True, nudging=False):
         """pos: Quartz (top-left) point; target: the hovered control's (x, y, w, h) or None."""
         if self.ring is None:
             return
-        state = None if (not visible or pos is None) else (round(pos[0]), round(pos[1]), target, locked, grabbing)
+        state = None if (not visible or pos is None) else (round(pos[0]), round(pos[1]), target, locked, grabbing, nudging)
         if state == self.last:
             return
         self.last = state
@@ -1309,8 +1372,8 @@ class Overlay:
             self.ring.setHidden_(True)
             self.glow.setHidden_(True)
         else:
-            self.style(self.GRAB if grabbing else self.LOCK if locked else self.HOVER if target else self.IDLE,
-                       0.45 if grabbing else None)
+            self.style(self.GRAB if grabbing else self.LOCK if locked else self.HOVER if target else
+                       self.NUDGE if nudging else self.IDLE, 0.45 if (grabbing or nudging) else None)
             self.ring.setPosition_((pos[0], self.sh - pos[1]))
             self.ring.setHidden_(False)
             if target:
@@ -1563,6 +1626,10 @@ def main():
     ap.add_argument("--precision", type=float, default=1.0,
                     help="slow hand movement moves the cursor this fraction (0.35 = a third; 1 = off): steadier aiming, "
                          "the cursor catches back up with the hand on quick moves")
+    ap.add_argument("--nudge", type=float, default=0.0, metavar="GAIN",
+                    help="aim: after the hand rests --nudge-dwell ms the cursor moves GAIN of the aim's movement (fine-tune "
+                         "the last few cm); a quick move snaps it back onto the aim. 0 = off")
+    ap.add_argument("--nudge-dwell", type=float, default=300, metavar="MS", help="aim: rest this long before nudging starts")
     ap.add_argument("--median", type=int, default=1, help="despike: median of the last N anchor points (3 kills single-frame jumps; 1 = off)")
     ap.add_argument("--detection", type=float, default=0.5, help="MediaPipe min hand detection confidence (lower finds a hand sooner in poor light)")
     ap.add_argument("--control", action="store_true",
@@ -1615,6 +1682,7 @@ def main():
               file=sys.stderr, flush=True)
     despike = Despike(args.median)
     precision = Precision(args.precision)
+    nudge = Nudge(args.nudge, args.nudge_dwell / 1000)
     rate = Rate()
     if args.enhance and args.prep == "none":
         args.prep = "enhance"
@@ -1644,6 +1712,12 @@ def main():
                     elif parts[:1] == ["precision"] and len(parts) == 2:
                         precision.gain = min(max(float(parts[1]), 0.05), 1.0)
                         precision.reset()
+                    elif parts[:1] == ["nudge"] and len(parts) in (2, 3):
+                        g = 0.0 if parts[1] == "off" else float(parts[1])
+                        nudge.gain = min(max(g, 0.0), 1.0)
+                        if len(parts) == 3:
+                            nudge.dwell = float(parts[2]) / 1000
+                        nudge.reset()
                     elif parts[:1] == ["median"] and len(parts) == 2:
                         despike.n = max(1, int(parts[1]))
                     elif parts[:1] == ["map"] and len(parts) == 2 and parts[1] in MAPS:
@@ -1913,7 +1987,12 @@ def main():
                         ahead = lead_gain(math.hypot(fx.dx, fy.dx), *args.lead_gate) * args.lead_ms / 1000
                         pos = (fx.lead(ahead), fy.lead(ahead))
                     smooth = pos
-                    pos = precision(pos, t_det)
+                    if isinstance(mapper, AimMap) and nudge.enabled:
+                        forming = (not math.isnan(dist) and dist < NUDGE_FREEZE_PINCH_M) or pinch.closed or (
+                            args.grip == "on" and ((not math.isnan(opened) and opened < NUDGE_FREEZE_OPEN) or grip.closed))
+                        pos = nudge(pos, t_det, freeze=forming)
+                    else:
+                        pos = precision(pos, t_det)
                     history.append((t_det, pos[0], pos[1]))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
@@ -1939,7 +2018,9 @@ def main():
                             target is None or rect_distance(pos, target) > 0):
                         target = hover
                     hover = target
-                    free = pos                                  # the unlocked filtered position: what a grab drags by
+                    # the unlocked filtered position: what a grab drags by (in aim mode the aim itself: the nudge
+                    # holds the cursor still while a pinch forms, and a drag must still follow the hand)
+                    free = smooth if isinstance(mapper, AimMap) else pos
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
                                       grab_at=click_at if held_down else None, target=target)
                     if probe and not grab.active:
@@ -1983,7 +2064,7 @@ def main():
                     t_ov = time.perf_counter()
                     slow.append(("track", t_ov - t_det))
                     overlay.update(pos, lock.frame if lock.at is not None else target, locked=lock.at is not None,
-                                   grabbing=grab.active, visible=cursor.enabled)
+                                   grabbing=grab.active, visible=cursor.enabled, nudging=nudge.on)
                     slow.append(("overlay", time.perf_counter() - t_ov))
             elif state == "held":
                 pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
@@ -1995,6 +2076,7 @@ def main():
                 lock.reset()
                 despike.reset()
                 precision.reset()
+                nudge.reset()
                 if grab.active:                                 # the hand vanished mid-grab: let go where it was
                     r = grab.end()
                     cursor.release(r[1], r[2])
@@ -2090,7 +2172,7 @@ def main():
                 if isinstance(mapper, AimMap):
                     c3 = lambda p: None if p is None else [round(v * 100, 1) for v in p]  # noqa: E731
                     pkt["aim"] = {"eye_cm": c3(mapper.E), "tip_cm": c3(mapper.F), "hit_cm": c3(mapper.hit),
-                                  "face": bool(mapper.eyes), "calibrated": mapper.calibrated,
+                                  "face": bool(mapper.eyes), "calibrated": mapper.calibrated, "nudge": nudge.on,
                                   "calibrating": aimcal is not None}
                 try:
                     diag.sendto(_json.dumps(pkt, separators=(",", ":")).encode(), ("127.0.0.1", args.diag))
@@ -2145,7 +2227,8 @@ def main():
                         if isinstance(mapper, AimMap) and not mapper.eyes else "")) or (
                     "HANDS OFF: say \"hands on\"" if not cursor.enabled else (
                         f"GRAB: {grab.dx:+.0f}, {grab.dy:+.0f} px" if grab.active else (
-                            "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else ""))))
+                            "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else (
+                                "NUDGE: small moves fine-tune" if nudge.on else "")))))
                 if label:
                     cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
                 t_pv = time.perf_counter()

@@ -599,5 +599,48 @@ with tempfile.TemporaryDirectory() as tmp:
     check(len(load_aim_rounds(SW, SH, "tip", path=path)) == 3, "the rounds are saved with the calibration")
     check(load_aim_rounds(SW, SH, "pip", path=path) == [], "rounds taken through another hand point are not reused")
 
+# --- nudge: aim, then fine-tune after a pause, a quick move snaps back ---
+from bench import Nudge  # noqa: E402
+n = Nudge(gain=0.4, dwell=0.3)
+t = 0.0
+for k in range(10):                                  # moving at 900 px/s: the cursor is the aim
+    t += 1 / 30
+    out = n((100 + 30 * k, 500), t)
+check(out == (370, 500) and not n.on, f"while the hand moves the cursor is on the aim ({out})")
+for k in range(20):                                  # resting ~0.66 s
+    t += 1 / 30
+    out = n((370 + (k % 2), 500), t)
+check(n.on, "after a 0.3 s rest the cursor starts nudging")
+start = out
+for k in range(30):                                  # a slow deliberate move: +150 px of aim over 1 s
+    t += 1 / 30
+    out = n((370 + 5 * (k + 1), 500), t)
+check(n.on and abs((out[0] - start[0]) - 0.4 * 150) < 3, f"a slow move of 150 px nudges the cursor 60 px ({out[0] - start[0]:.1f})")
+for k in range(4):                                   # a quick move: 60 px a frame = 1800 px/s
+    t += 1 / 30
+    out = n((520 + 60 * (k + 1), 500), t)
+check(not n.on and out == (760, 500), f"a quick move puts the cursor back on the aim ({out})")
+n = Nudge(gain=0.4, dwell=0.3)
+t = 0.0
+for k in range(20):
+    t += 1 / 30
+    out = n((400, 400), t)
+check(n.on, "nudging after a rest")
+held = out
+for k in range(6):                                   # a pinch forming: the fingertip (the aim) jumps 200 px
+    t += 1 / 30
+    out = n((400 + 40 * k, 400 - 30 * k), t, freeze=True)
+check(out == held and n.on, f"while a pinch forms the cursor holds still and nothing snaps ({out})")
+n = Nudge(gain=0.4, dwell=0.3, leash=100)
+t = 0.0
+for k in range(20):
+    t += 1 / 30
+    n((400, 400), t)
+for k in range(60):                                  # a long slow move: the cursor falls 60 % behind
+    t += 1 / 30
+    out = n((400 + 3 * (k + 1), 400), t)
+check(not n.on, f"a cursor left more than the leash behind the aim goes back onto it ({out})")
+check(Nudge(gain=0.0)((5, 5), 0.0) == (5, 5) and not Nudge(gain=1.0).enabled, "gain 0 or 1 is off")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)
