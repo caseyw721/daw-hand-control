@@ -29,7 +29,7 @@ from bench import (AIM_CAL_PATH, POOL_ROUNDS, POOL_ROUND_MAX_PX, AimCalibration,
                    save_aim_cal)
 
 W, H, SW, SH, MM = 1280, 720, 1728, 1117, (345.0, 223.0)
-START = re.compile(r"calibrate (the )?(pointing|pointer|aim|aiming)|(start|run|redo|repeat) (the )?calibration|"
+START = re.compile(r"(calibrate|calibrated|calibrating|calorie|calvary|celebrate) (the )?(pointing|pointer|aim|aiming)|(start|run|redo|repeat) (the )?calibration|"
                    r"(redo|repeat) the test", re.I)
 SESSIONS = os.path.expanduser("~/Library/Logs/DAW Control/sessions")
 
