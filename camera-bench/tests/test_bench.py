@@ -259,9 +259,16 @@ def cursor_at(m, centre_m, anchor=0, frames=40):
     return out
 
 
+m0 = MetricMap(1728, 1117, pad=(0.24, 0.15))
+first = cursor_at(m0, (0.0, 0.02, 0.50))
+anchor_x = -(0.0 + hand[0][0])                     # the anchor landmark, mirrored, in metres from the camera line
+check(abs(first[0] - (1727 / 2 + anchor_x / 0.24 * 1727)) < 3 and abs(first[1] - 1116 / 2) < 1,
+      f"across is centred on the camera line, down on where the hand first appears ({first})")
 m = MetricMap(1728, 1117, pad=(0.24, 0.15))
 start = cursor_at(m, (0.05, 0.02, 0.50))
-check(abs(start[0] - 1727 / 2) < 1 and abs(start[1] - 1116 / 2) < 1, f"the first position is the screen centre ({start})")
+m.recenter_next = True
+start = cursor_at(m, (0.05, 0.02, 0.50))
+check(abs(start[0] - 1727 / 2) < 1 and abs(start[1] - 1116 / 2) < 1, f"recenter makes the current position the centre ({start})")
 toward = cursor_at(m, (0.05, 0.02, 0.35))
 check(abs(toward[0] - start[0]) < 12 and abs(toward[1] - start[1]) < 12,
       f"moving 15 cm toward the camera, off-axis, barely moves the cursor ({start} -> {toward})")

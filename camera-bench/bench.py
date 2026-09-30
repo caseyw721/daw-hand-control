@@ -449,8 +449,13 @@ class MetricMap:
         X = -(nx * cam_w - cam_w / 2) / s        # mirrored: the user's right is +X
         Y = (ny * cam_h - cam_h / 2) / s
         self.last = (X, Y)
-        if self.centre is None or self.recenter_next:
+        if self.recenter_next:
             self.centre, self.recenter_next = (X, Y), False
+        elif self.centre is None:
+            # across: the camera's line (it sits at the top-middle of the screen, so a hand straight in front of
+            # it is the screen's middle); down: where the hand first appears. The first-seen position for both
+            # put the centre 19 cm off when the hand came in from the side (found live); "recenter" still sets both.
+            self.centre = (0.0, Y)
         u = min(max((X - self.centre[0]) / self.pad[0] + 0.5, 0.0), 1.0)
         v = min(max((Y - self.centre[1]) / self.pad[1] + 0.5, 0.0), 1.0)
         return u * (self.w - 1), v * (self.h - 1)
