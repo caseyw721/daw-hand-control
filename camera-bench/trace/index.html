@@ -22,7 +22,7 @@
 <canvas id="c"></canvas>
 <div id="hud"><div><div id="task"></div><div id="hint"></div></div><div id="live"></div></div>
 <div id="results"></div>
-<div id="keys">R restart this task · N next · A all again</div>
+<div id="keys">R restart task · N next · A all again · T trail on/off · C clear trail · + / − longer / shorter trail</div>
 <script>
 // Each task: the cursor rests in the green dot to start (like the hover lock), follows the blue path,
 // and ends in the red dot. Deviation is the perpendicular distance from the path; jitter is the
@@ -41,6 +41,8 @@ const TASKS = [
   { name: 'Box', hint: 'Around the box, clockwise from the top-left corner.', pts: () => { const x0 = w() * .25, x1 = w() * .75, y0 = h() * .22, y1 = h() * .78; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]; } },
 ];
 let ti = 0, state = 'wait', restSince = null, track = [], results = [], mouse = null;
+// The cursor's recent path, drawn everywhere it goes (user request): newest bright, fading out over TRAIL_MS.
+let trail = [], TRAIL_MS = 4000, trailOn = true;
 const R = 26;
 function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
 function segDist(p, a, b) {
@@ -72,6 +74,7 @@ function renderResults() {
 }
 addEventListener('pointermove', e => {
   const now = performance.now(); mouse = [e.clientX, e.clientY];
+  trail.push({ x: mouse[0], y: mouse[1], t: now });
   const task = TASKS[ti], pts = task.pts();
   if (state === 'wait') {
     if (dist(mouse, pts[0]) < R) { restSince = restSince ?? now; if (now - restSince > 300) { state = 'go'; track = [{ x: mouse[0], y: mouse[1], t: now }]; } }
@@ -87,7 +90,24 @@ addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') reset();
   if (e.key === 'n' || e.key === 'N') { ti = (ti + 1) % TASKS.length; reset(); }
   if (e.key === 'a' || e.key === 'A') { ti = 0; results = []; renderResults(); reset(); }
+  if (e.key === 't' || e.key === 'T') { trailOn = !trailOn; trail = []; draw(); }
+  if (e.key === 'c' || e.key === 'C') { trail = []; draw(); }
+  if (e.key === '+' || e.key === '=') { TRAIL_MS = Math.min(30000, TRAIL_MS * 2); }
+  if (e.key === '-' || e.key === '_') { TRAIL_MS = Math.max(500, TRAIL_MS / 2); }
 });
+function drawTrail(now) {
+  trail = trail.filter(p => now - p.t < TRAIL_MS);
+  if (!trailOn || trail.length < 2) return;
+  g.lineWidth = 2; g.lineCap = 'round'; g.lineJoin = 'round';
+  for (let i = 1; i < trail.length; i++) {
+    const a = trail[i - 1], b = trail[i], age = (now - b.t) / TRAIL_MS;
+    g.strokeStyle = `rgba(56, 232, 140, ${Math.max(0, 1 - age).toFixed(3)})`;
+    g.beginPath(); g.moveTo(a.x, a.y); g.lineTo(b.x, b.y); g.stroke();
+  }
+  const p = trail[trail.length - 1];
+  g.fillStyle = 'rgba(56, 232, 140, 0.9)'; g.beginPath(); g.arc(p.x, p.y, 4, 0, 7); g.fill();
+}
+(function fade() { draw(); requestAnimationFrame(fade); })();   // keeps the trail fading while the cursor rests
 function draw() {
   g.clearRect(0, 0, w(), h());
   const task = TASKS[ti], pts = task.pts();
@@ -97,6 +117,7 @@ function draw() {
   if (pts.length > 1) { g.beginPath(); g.moveTo(...pts[0]); for (const p of pts.slice(1)) g.lineTo(...p); g.stroke(); }
   g.fillStyle = '#22c55e'; g.beginPath(); g.arc(...pts[0], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1;
   if (pts.length > 1) { g.fillStyle = '#ef4444'; g.beginPath(); g.arc(...pts[pts.length - 1], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1; }
+  drawTrail(performance.now());
   if (track.length > 1) { g.strokeStyle = '#fbbf24'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(track[0].x, track[0].y); for (const p of track) g.lineTo(p.x, p.y); g.stroke(); }
   if (mouse) { document.getElementById('live').textContent = `off path ${pathDist(mouse, pts).toFixed(0)} px`; }
 }
