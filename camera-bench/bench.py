@@ -2197,10 +2197,13 @@ def main():
                         quick = t_det - tap["t"] <= TAP_S
                         if quick and not tap["grabbed"] and args.tap == "on" and cursor.enabled and thumb_mode:
                             at = lock.at if lock.at is not None else pos
-                            cursor.press(*at)
-                            cursor.release(*at)
-                            print(f"I,tap,click,{at[0]:.0f},{at[1]:.0f}", file=sys.stderr, flush=True)
-                            sound.play("Pop")
+                            if 0 <= at[0] < sw and 0 <= at[1] < sh:
+                                cursor.press(*at)
+                                cursor.release(*at)
+                                print(f"I,tap,click,{at[0]:.0f},{at[1]:.0f}", file=sys.stderr, flush=True)
+                                sound.play("Pop")
+                            else:                     # aimed off the screen: never click (the edge would be the Dock)
+                                print(f"I,tap,off-screen,{at[0]:.0f},{at[1]:.0f}", file=sys.stderr, flush=True)
                         tap = None
                     if event == "down":
                         click_at = pos
