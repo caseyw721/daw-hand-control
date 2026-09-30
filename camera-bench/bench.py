@@ -209,6 +209,7 @@ class Nudge:
         return aim
 
 
+TAP_S = 0.4                  # the finger gun: a trigger press shorter than this that did not grab is a click
 REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
 
 
@@ -1631,6 +1632,8 @@ def main():
                     help="aim: what grabs and holds a lock: pinch (thumb to index tip; moves the aim) or thumb (press the "
                          "thumb against the side of the hand, a finger gun: the index, and the aim, stay put); with thumb, "
                          "a pinch or a closed hand no longer grabs")
+    ap.add_argument("--tap", choices=["on", "off"], default="on",
+                    help="aim with --trigger thumb: a quick trigger tap (under 0.4 s) that did not grab clicks at the cursor")
     ap.add_argument("--thumb-on", type=float, default=0.015, help="thumb trigger presses below this thumb-to-hand distance (m)")
     ap.add_argument("--thumb-off", type=float, default=0.03,
                     help="thumb trigger: the thumb counts as raised (arming the trigger, or letting go) above this (m)")
@@ -1807,6 +1810,8 @@ def main():
                     elif parts[:1] == ["precision"] and len(parts) == 2:
                         precision.gain = min(max(float(parts[1]), 0.05), 1.0)
                         precision.reset()
+                    elif parts[:1] == ["tap"] and len(parts) == 2 and parts[1] in ("on", "off"):
+                        args.tap = parts[1]
                     elif parts[:1] == ["trigger"] and len(parts) in (2, 4) and parts[1] in ("pinch", "thumb"):
                         args.trigger = parts[1]
                         if len(parts) == 4:
@@ -1882,6 +1887,7 @@ def main():
     grab_state = None             # "pending" | "active" | None, sent with each frame so the gesture engine stands down
     pending_frame = None
     hover = None                  # the control highlighted last frame (sticky, see STICKY_PX)
+    tap = None                    # the finger gun's press in progress: {"t", "grabbed"} (a quick one clicks)
     presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
     hand_hist = collections.deque(maxlen=64)  # (t, pinch m, openness) alongside it, for rewind_point
@@ -2109,6 +2115,7 @@ def main():
                         print(f"I,trigger,{tevent},{pressed_m:.3f}", file=sys.stderr, flush=True)
                         if tevent == "down":
                             sound.play("Tink")
+                            tap = {"t": t_det, "grabbed": False}
                     thumb_mode = isinstance(mapper, AimMap) and args.trigger == "thumb"
                     held = thumb.closed if thumb_mode else (pinch.closed or (args.grip == "on" and grip.closed))
                     held_down = held and not held_was
@@ -2172,6 +2179,19 @@ def main():
                                 cursor.release(r[1], r[2])
                                 cursor.warp(r[3], r[4])
                                 print(f"I,grab,release,{r[2] - r[4]:+.0f}px,{r[1] - r[3]:+.0f}px across", file=sys.stderr, flush=True)
+                    if tap is not None and grab.active:
+                        tap["grabbed"] = True
+                    if tevent == "up" and tap is not None:
+                        # the finger gun fires: a quick tap that did not become a grab clicks where the cursor is held
+                        # (user, live, trying to open Logic from the Dock with the trigger)
+                        quick = t_det - tap["t"] <= TAP_S
+                        if quick and not tap["grabbed"] and args.tap == "on" and cursor.enabled and thumb_mode:
+                            at = lock.at if lock.at is not None else pos
+                            cursor.press(*at)
+                            cursor.release(*at)
+                            print(f"I,tap,click,{at[0]:.0f},{at[1]:.0f}", file=sys.stderr, flush=True)
+                            sound.play("Pop")
+                        tap = None
                     if event == "down":
                         click_at = pos
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
