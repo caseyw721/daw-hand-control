@@ -233,42 +233,136 @@ def point_of(lm, which):
     return sum(lm[k][0] for k in ks) / 4, sum(lm[k][1] for k in ks) / 4
 
 
-class Lock:
-    """Hover lock: once the pointer has rested (filtered speed under `still` px/s) for `dwell` s, the
-    cursor stays where it rested and small hand motion is ignored, so the finger that grabs cannot drag
-    it off the target. A move of more than `breakout` px from the locked spot releases it. While a grab
-    is held (pinch closed) it never releases; a grab that starts unlocked locks where the pointer was
-    just before the pinch (the Heisenberg spot). dwell 0 = hover locking off (grabs still lock)."""
+CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
+                 "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
+                 "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
+SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 
-    def __init__(self, dwell=0.2, still=120.0, breakout=50.0):
-        self.dwell, self.still, self.breakout = dwell, still, breakout
+
+class Lock:
+    """Hover lock onto controls (user, live: "it's not locking to buttons when they're hovered over, it's
+    just locking wherever it stops"). When the pointer rests (filtered speed under `still` px/s) for
+    `dwell` s over a control that Accessibility reports (a button, slider, knob, checkbox, menu item...),
+    the cursor locks onto it: small controls snap to their centre, big ones lock where the cursor is.
+    Hand motion is ignored until it leaves the control's frame by `breakout` px. Resting anywhere else
+    does not lock (`anywhere` restores the old rest-anywhere lock). While a grab is held (pinch closed)
+    it never releases; a grab that starts unlocked locks where the pointer was just before the pinch."""
+
+    def __init__(self, dwell=0.2, still=120.0, breakout=50.0, anywhere=False):
+        self.dwell, self.still, self.breakout, self.anywhere = dwell, still, breakout, anywhere
         self.at = None             # (x, y) while locked
+        self.frame = None          # (x, y, w, h) of the control locked onto
         self.still_since = None
 
-    def update(self, pos, t, speed, held=False, grab_at=None):
-        """The position to show for this frame."""
+    def _inside(self, pos):
+        if self.frame is None:
+            return math.hypot(pos[0] - self.at[0], pos[1] - self.at[1]) <= self.breakout
+        x, y, w, h = self.frame
+        m = self.breakout
+        return x - m <= pos[0] <= x + w + m and y - m <= pos[1] <= y + h + m
+
+    def update(self, pos, t, speed, held=False, grab_at=None, target=None):
+        """The position to show for this frame. `target` is the control under the pointer, (x, y, w, h)
+        in screen points, or None."""
         if self.at is not None:
-            if held or math.hypot(pos[0] - self.at[0], pos[1] - self.at[1]) <= self.breakout:
+            if held or self._inside(pos):
                 return self.at
-            self.at = None
+            self.at = self.frame = None
             self.still_since = None
             return pos
         if held:
             self.at = grab_at or pos
             return self.at
-        if self.dwell > 0 and speed < self.still:
+        if self.dwell > 0 and speed < self.still and (target is not None or self.anywhere):
             if self.still_since is None:
                 self.still_since = t
             elif t - self.still_since >= self.dwell:
-                self.at = pos
+                if target is not None:
+                    x, y, w, h = target
+                    small = w <= SNAP_MAX_PX and h <= SNAP_MAX_PX
+                    self.at = (x + w / 2, y + h / 2) if small else pos
+                    self.frame = target
+                else:
+                    self.at = pos
                 return self.at
         else:
             self.still_since = None
         return pos
 
     def reset(self):
-        self.at = None
+        self.at = self.frame = None
         self.still_since = None
+
+
+class AXProbe:
+    """What is under the cursor, from Accessibility, a few times a second on a background thread (a
+    lookup takes ~15 ms, too slow for the frame loop). `control_at(pos)` gives the frame of a control
+    containing pos if one was seen there recently, else None. Without the bindings or the permission it
+    stays empty and hover locking simply never engages."""
+
+    def __init__(self, period=0.08):
+        self.period = period
+        self.pos = None
+        self.found = None          # (t, role, (x, y, w, h), title)
+        self.ok = False
+        try:
+            import ApplicationServices as AS
+            self.AS = AS
+            self.sys = AS.AXUIElementCreateSystemWide()
+            self.ok = True
+        except Exception:
+            self.AS = None
+        if self.ok:
+            import threading
+            threading.Thread(target=self._run, name="ax-probe", daemon=True).start()
+
+    def _attr(self, el, name):
+        err, v = self.AS.AXUIElementCopyAttributeValue(el, name, None)
+        return v if err == 0 else None
+
+    def _frame(self, el):
+        p, s = self._attr(el, "AXPosition"), self._attr(el, "AXSize")
+        if p is None or s is None:
+            return None
+        ok, pt = self.AS.AXValueGetValue(p, self.AS.kAXValueCGPointType, None)
+        ok2, sz = self.AS.AXValueGetValue(s, self.AS.kAXValueCGSizeType, None)
+        if not (ok and ok2):
+            return None
+        return (pt.x, pt.y, sz.width, sz.height)
+
+    def _run(self):
+        last = None
+        while True:
+            time.sleep(self.period)
+            pos = self.pos
+            if pos is None or (last is not None and math.hypot(pos[0] - last[0], pos[1] - last[1]) < 2
+                               and self.found and time.monotonic() - self.found[0] < 0.5):
+                continue
+            last = pos
+            try:
+                err, el = self.AS.AXUIElementCopyElementAtPosition(self.sys, pos[0], pos[1], None)
+                if err != 0 or el is None:
+                    self.found = (time.monotonic(), None, None, "")
+                    continue
+                role = self._attr(el, "AXRole") or ""
+                frame = self._frame(el)
+                title = self._attr(el, "AXTitle") or self._attr(el, "AXDescription") or ""
+                self.found = (time.monotonic(), str(role), frame, str(title))
+            except Exception:
+                self.found = (time.monotonic(), None, None, "")
+
+    def control_at(self, pos):
+        f = self.found
+        if not f or f[1] not in CONTROL_ROLES or f[2] is None or time.monotonic() - f[0] > 0.4:
+            return None
+        x, y, w, h = f[2]
+        if w * h > 300 * 300 or not (x - 2 <= pos[0] <= x + w + 2 and y - 2 <= pos[1] <= y + h + 2):
+            return None
+        return f[2]
+
+    def label(self):
+        f = self.found
+        return f"{f[1] or '-'} {f[3][:24]}".strip() if f else ""
 
 
 class AbsoluteMap:
@@ -449,6 +543,69 @@ class Cursor:
         self._post(self.Q.kCGEventLeftMouseUp, x, y)
         self.down = False
 
+    def drag(self, x, y, dx, dy):
+        """A drag with the delta fields set too: knobs that hide and warp the cursor read the deltas."""
+        if not self.enabled:
+            return
+        ev = self.Q.CGEventCreateMouseEvent(None, self.Q.kCGEventLeftMouseDragged, (x, y), 0)
+        self.Q.CGEventSetIntegerValueField(ev, self.Q.kCGMouseEventDeltaX, int(round(dx)))
+        self.Q.CGEventSetIntegerValueField(ev, self.Q.kCGMouseEventDeltaY, int(round(dy)))
+        self.Q.CGEventPost(self.Q.kCGHIDEventTap, ev)
+
+    def warp(self, x, y):
+        """Puts the cursor back without a move event (the end of a grab)."""
+        if not self.enabled:
+            return
+        self.Q.CGWarpMouseCursorPosition((x, y))
+        self.Q.CGAssociateMouseAndMouseCursorPosition(True)
+
+
+DRAG_ROLES = {"AXSlider", "AXIncrementor", "AXValueIndicator", "AXLevelIndicator"}
+
+
+class Grab:
+    """The grab session (user's design, 2026-09-29): pinch and hold on a knob or slider, the tracker presses
+    the mouse there after `hold_s` (a quick pinch never presses: pinches stay gestures), vertical hand
+    movement drags it (`gain` px of drag per px of free cursor movement), and releasing the pinch lets go
+    and puts the cursor back where the grab began. mode: off; drag = only on sliders/knobs Accessibility
+    reports; any = anywhere (for plug-in GUIs that hide their knobs from Accessibility)."""
+
+    def __init__(self, mode="off", gain=0.6, hold_s=0.25):
+        self.mode, self.gain, self.hold_s = mode, gain, hold_s
+        self.reset()
+
+    def reset(self):
+        self.at = self.t0 = self.y0 = None
+        self.active = self.allowed = False
+        self.dy = 0.0
+
+    def begin(self, at, t, y, role):
+        self.reset()
+        self.at, self.t0, self.y0 = at, t, y
+        self.allowed = self.mode == "any" or (self.mode == "drag" and role in DRAG_ROLES)
+
+    def step(self, t, y):
+        """('press', x, y) once the hold has lasted, then ('drag', x, y, ddy) as the hand moves; else None."""
+        if self.at is None or not self.allowed:
+            return None
+        if not self.active:
+            if t - self.t0 >= self.hold_s:
+                self.active, self.y0, self.dy = True, y, 0.0
+                return ("press", self.at[0], self.at[1])
+            return None
+        dy = (y - self.y0) * self.gain
+        ddy = dy - self.dy
+        if abs(ddy) < 0.5:
+            return None
+        self.dy = dy
+        return ("drag", self.at[0], self.at[1] + dy, ddy)
+
+    def end(self):
+        """('release', x, y, back_x, back_y) if a press happened, else None; the session is over."""
+        r = ("release", self.at[0], self.at[1] + self.dy, self.at[0], self.at[1]) if self.active else None
+        self.reset()
+        return r
+
 
 class Sound:
     """System sounds as feedback the user can hear without watching the log."""
@@ -603,6 +760,12 @@ def main():
                          "than --breakout px (0 = off; a pinch always locks for the length of the grab)")
     ap.add_argument("--breakout", type=float, default=50, help="px the hand must move to leave a hover lock")
     ap.add_argument("--lock-speed", type=float, default=120, help="px/s under which the pointer counts as resting")
+    ap.add_argument("--lock-anywhere", action="store_true",
+                    help="hover lock wherever the pointer rests (default: only on controls Accessibility reports)")
+    ap.add_argument("--grab", choices=["off", "drag", "any"], default="off",
+                    help="pinch-and-hold drags the knob or slider under the cursor (drag) or anything (any); a quick "
+                         "pinch never presses")
+    ap.add_argument("--grab-gain", type=float, default=0.6, help="px of drag per px of hand movement while grabbing")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -649,6 +812,9 @@ def main():
     ap.add_argument("--log", help="CSV of every frame")
     ap.add_argument("--dump", help="directory: at each drop-out save the last frame with a hand and the first without")
     ap.add_argument("--frames", metavar="PATH", help="write every frame's landmarks as one JSON line to PATH ('-' = stdout), for the gesture engine")
+    ap.add_argument("--diag", type=int, default=0, metavar="PORT",
+                    help="send every frame's pointer pipeline (image anchor, hand in cm, distance, each filter stage, "
+                         "lock, grab) as UDP JSON to 127.0.0.1:PORT, for the live diagnostic page (trace/diag.html)")
     ap.add_argument("--hands", type=int, default=1, help="hands to track (2 for two-hand gestures; costs detect time)")
     ap.add_argument("--enhance", action="store_true", help="same as --prep enhance")
     ap.add_argument("--prep", choices=list(PREPS), default="none",
@@ -679,7 +845,19 @@ def main():
     mapper = make_mapper(args.mode)
     nonlocal_state = {}           # requests from the control thread, applied between frames by the main loop
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
-    lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout)
+    lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout, anywhere=args.lock_anywhere)
+    grab = Grab(args.grab, args.grab_gain)
+    diag = None
+    if args.diag:
+        import json as _json
+        import socket as _socket
+        diag = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        diag.setblocking(False)
+    f_px = (1280 / 2) / math.tan(math.radians(35))       # MacBook camera: ~70 degrees across (for the distance readout)
+    probe = AXProbe() if (args.lock_ms or args.grab != "off") else None
+    if args.lock_ms and not (probe and probe.ok):
+        print("I,warning,no Accessibility bindings (pip install pyobjc-framework-ApplicationServices): hover lock off",
+              file=sys.stderr, flush=True)
     despike = Despike(args.median)
     rate = Rate()
     if args.enhance and args.prep == "none":
@@ -720,6 +898,13 @@ def main():
                         lock.dwell, lock.breakout = float(parts[1]) / 1000, float(parts[2])
                         if len(parts) == 4:
                             lock.still = float(parts[3])
+                        lock.reset()
+                    elif parts[:1] == ["grab"] and len(parts) in (2, 3) and parts[1] in ("off", "drag", "any"):
+                        grab.mode = parts[1]
+                        if len(parts) == 3:
+                            grab.gain = float(parts[2])
+                    elif parts[:1] == ["lockon"] and len(parts) == 2 and parts[1] in ("controls", "anywhere"):
+                        lock.anywhere = parts[1] == "anywhere"
                         lock.reset()
                     else:
                         raise ValueError(raw.strip())
@@ -832,7 +1017,8 @@ def main():
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_last.jpg"), last_hand_frame)
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_lost.jpg"), frame)
                     last_hand_frame, dumps = None, dumps + 1
-            raw = pos = None
+            raw = pos = q = free = None
+            nx = ny = None
             ratio = dist = float("nan")
             event = None
             if hand:
@@ -878,9 +1064,33 @@ def main():
                     # Heisenberg: the pinch itself nudges the finger; use the position from before it.
                     tb = t_det - args.heisenberg_ms / 1000
                     click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
+                    if probe is None and (lock.dwell > 0 or grab.mode != "off"):
+                        probe = AXProbe()                       # turned on live by `lock <ms> ...` or `grab ...`
+                    target = probe.control_at(pos) if probe else None
+                    free = pos                                  # the unlocked filtered position: what a grab drags by
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=pinch.closed,
-                                      grab_at=click_at if event == "down" else None)
+                                      grab_at=click_at if event == "down" else None, target=target)
+                    if probe and not grab.active:
+                        probe.pos = pos
                     marker.move(*pos)
+                    # the grab session: pinch-and-hold presses, vertical movement drags, release returns the cursor
+                    if grab.mode != "off":
+                        if event == "down":
+                            role = probe.found[1] if (probe and probe.found) else None
+                            grab.begin(pos, t_det, free[1], role)
+                        if pinch.closed and grab.at is not None:
+                            a = grab.step(t_det, free[1])
+                            if a and a[0] == "press":
+                                cursor.press(a[1], a[2])
+                                print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f}", file=sys.stderr, flush=True)
+                            elif a and a[0] == "drag":
+                                cursor.drag(a[1], a[2], 0, a[3])
+                        elif grab.at is not None and not pinch.closed:
+                            r = grab.end()
+                            if r:
+                                cursor.release(r[1], r[2])
+                                cursor.warp(r[3], r[4])
+                                print(f"I,grab,release,{r[2] - r[4]:+.0f}px", file=sys.stderr, flush=True)
                     if event == "down":
                         click_at = pos
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
@@ -891,7 +1101,7 @@ def main():
                         print(f"P,{t_det - t0:.2f},up,{dist:.3f},{pos[0]:.0f},{pos[1]:.0f}", file=sys.stderr, flush=True)
                         if args.click:
                             cursor.release(*pos)
-                    else:
+                    elif not grab.active:
                         cursor.move(*pos)
             elif state == "held":
                 pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
@@ -902,6 +1112,11 @@ def main():
                 fx.reset(); fy.reset()
                 lock.reset()
                 despike.reset()
+                if grab.active:                                 # the hand vanished mid-grab: let go where it was
+                    r = grab.end()
+                    cursor.release(r[1], r[2])
+                    cursor.warp(r[3], r[4])
+                grab.reset()
                 last_pos = None
                 if cursor.down:
                     cursor.release(*(history[-1][1:] if history else (sw / 2, sh / 2)))
@@ -910,6 +1125,28 @@ def main():
                 pinch.reset()
             t_post = time.perf_counter()
             loop_ms.append((t_post - t_loop) * 1000)
+
+            if diag is not None:
+                # one packet per frame: every stage from the camera image to the cursor, for trace/diag.html
+                r2 = lambda p: None if p is None else [round(p[0], 1), round(p[1], 1)]  # noqa: E731
+                pkt = {"t": round(t_det - t0, 3), "fps": round(fps_now, 1), "det": round((t_det - t_frame) * 1000, 1),
+                       "state": state, "hand": bool(hand), "screen": [sw, sh], "mode": args.mode, "point": args.point,
+                       "img": None if nx is None else [round(nx, 4), round(ny, 4)],
+                       "raw": r2(raw), "despiked": r2(q), "filtered": r2(free), "cursor": r2(pos),
+                       "locked": lock.at is not None, "lock_frame": None if lock.frame is None else [round(v) for v in lock.frame],
+                       "under": probe.label() if probe else "", "pinch": bool(pinch.closed),
+                       "pinch_m": None if dist != dist else round(dist, 4),
+                       "grab": grab.active, "grab_dy": round(grab.dy, 1)}
+                if isinstance(mapper, MetricMap):
+                    pkt["metric"] = None if mapper.last is None else [round(mapper.last[0] * 100, 2), round(mapper.last[1] * 100, 2)]
+                    pkt["centre"] = None if mapper.centre is None else [round(mapper.centre[0] * 100, 2), round(mapper.centre[1] * 100, 2)]
+                    pkt["pad"] = [round(mapper.pad[0] * 100, 1), round(mapper.pad[1] * 100, 1)]
+                    pkt["dist_cm"] = None if not mapper.s else round(f_px * (cw / 1280) / mapper.s * 100, 1)
+                    pkt["px_per_m"] = None if not mapper.s else round(mapper.s, 1)
+                try:
+                    diag.sendto(_json.dumps(pkt, separators=(",", ":")).encode(), ("127.0.0.1", args.diag))
+                except OSError:
+                    pass
 
             if log:
                 log.writerow([f"{t_frame - t0:.4f}", f"{(t_det - t_frame) * 1000:.2f}", f"{(t_post - t_det) * 1000:.2f}",
@@ -938,8 +1175,10 @@ def main():
                     stats += f"   hand ~{d * 100:.0f} cm away"
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fcol, 1)
+                on = f" on {probe.label()}" if (probe and lock.frame is not None) else ""
                 label = "CALIBRATING: sweep your range" if calibrating else (
-                    "PINCH (locked)" if pinch.closed else ("LOCKED" if lock.at is not None else ""))
+                    f"GRAB: turning {grab.dy:+.0f} px" if grab.active else (
+                        "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else "")))
                 if label:
                     cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
                 cv2.imshow("camera bench (q quits)", disp)

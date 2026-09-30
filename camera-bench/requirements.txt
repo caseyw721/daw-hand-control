@@ -2,3 +2,4 @@ mediapipe==0.10.21
 opencv-python<5
 numpy<2
 pyobjc-framework-Quartz
+pyobjc-framework-ApplicationServices  # Accessibility: what is under the cursor (hover lock onto controls)

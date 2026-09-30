@@ -170,19 +170,32 @@ for i in range(60):
     fps = r.tick(i / 30)
 check(abs(fps - 30) < 0.5, f"frame rate reads 30 at 30 fps ({fps:.2f})")
 
-# --- hover lock: rest locks, small motion is ignored, a real move breaks out, a grab never breaks ---
-k = Lock(dwell=0.2, still=120, breakout=50)
+# --- hover lock onto controls: resting on a control locks (small ones snap to their centre), resting on
+#     nothing does not; leaving the control's frame releases; a grab never releases ---
+k = Lock(dwell=0.2, still=120, breakout=20)
 t = 0.0
-out = None
-for i in range(10):                 # resting at (500, 400) for 0.3 s
-    out = k.update((500 + (i % 2) * 3, 400), t, 20.0)
+for i in range(10):                 # resting over empty space for 0.3 s
+    k.update((500 + (i % 2) * 3, 400), t, 20.0, target=None)
     t += 1 / 30
-check(k.at is not None, "resting 0.2 s locks")
-held_at = k.at
+check(k.at is None, "resting where there is no control does not lock (user: it locked wherever it stopped)")
+button = (480, 385, 40, 30)          # a 40 x 30 button under the pointer
+for i in range(10):
+    out = k.update((505 + (i % 2) * 3, 402), t, 20.0, target=button)
+    t += 1 / 30
+check(k.at == (500, 400), f"resting on a small control snaps to its centre ({k.at})")
 out = k.update((530, 420), t, 300.0)
-check(out == held_at, "a 36 px wobble stays locked")
+check(out == (500, 400), "motion inside the control plus margin stays locked")
 out = k.update((600, 400), t + 0.03, 900.0)
-check(k.at is None and out == (600, 400), "a 100 px move breaks out and the cursor follows")
+check(k.at is None and out == (600, 400), "leaving the control breaks out and the cursor follows")
+fader = (100, 100, 30, 300)          # a tall fader: no snap, lock where the pointer is
+k = Lock(dwell=0.2, still=120, breakout=20)
+for i in range(10):
+    k.update((110, 250), i / 30, 10.0, target=fader)
+check(k.at == (110, 250), f"a big control locks in place, no snap ({k.at})")
+k = Lock(dwell=0.2, still=120, breakout=50, anywhere=True)
+for i in range(10):
+    k.update((700, 700), i / 30, 10.0, target=None)
+check(k.at == (700, 700), "`anywhere` restores the rest-anywhere lock")
 k = Lock(dwell=0.2, still=120, breakout=50)
 out = k.update((300, 300), 0.0, 400.0, held=True, grab_at=(290, 305))
 check(out == (290, 305), "a grab locks where the pointer was just before the pinch")
@@ -194,6 +207,27 @@ k = Lock(dwell=0, still=120, breakout=50)
 for i in range(20):
     out = k.update((100, 100), i / 30, 10.0)
 check(k.at is None, "dwell 0 turns hover locking off")
+
+# --- grab session: a quick pinch never presses; a held one presses, drags by the hand, and returns ---
+from bench import Grab  # noqa: E402
+gb = Grab("drag", gain=0.5, hold_s=0.25)
+gb.begin((400, 300), 0.0, 500.0, "AXSlider")
+check(gb.step(0.1, 500.0) is None, "no press before the hold time (a tap stays a gesture)")
+check(gb.end() is None, "a quick pinch ends with no press and no release")
+gb.begin((400, 300), 0.0, 500.0, "AXSlider")
+check(gb.step(0.3, 500.0) == ("press", 400, 300), "a held pinch presses where the grab began")
+a = gb.step(0.35, 480.0)
+check(a == ("drag", 400, 290.0, -10.0), f"20 px of hand movement up drags 10 px up at gain 0.5 ({a})")
+check(gb.step(0.4, 480.2) is None, "sub-pixel changes send nothing")
+check(gb.end() == ("release", 400, 290.0, 400, 300), "release lets go where the drag ended and returns to the grab point")
+gb.begin((400, 300), 0.0, 500.0, "AXButton")
+check(gb.step(1.0, 400.0) is None, "drag mode never presses a button")
+gb = Grab("any")
+gb.begin((10, 10), 0.0, 0.0, None)
+check(gb.step(0.3, 0.0)[0] == "press", "any mode grabs where Accessibility sees nothing (plug-in GUIs)")
+gb = Grab("off")
+gb.begin((10, 10), 0.0, 0.0, "AXSlider")
+check(gb.step(1.0, 0.0) is None, "off never grabs")
 
 # --- metric mapping: 3-D hand position to a steady 2-D cursor (the parallax fix) ---
 from bench import MetricMap, px_per_metre  # noqa: E402

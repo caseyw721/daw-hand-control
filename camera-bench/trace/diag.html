@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pointer Diagnostic</title>
+<style>
+  :root { --bg: #0f1216; --panel: #171b21; --line: #2a313a; --fg: #e6e8eb; --muted: #8a929c;
+          --raw: #9aa3ad; --desp: #60a5fa; --filt: #fbbf24; --cur: #34d399; --hand: #f472b6; --lock: #f87171; }
+  html, body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.4 -apple-system, system-ui, sans-serif; }
+  header { display: flex; align-items: baseline; gap: 16px; padding: 12px 16px 4px; flex-wrap: wrap; }
+  h1 { font-size: 17px; margin: 0; }
+  #status { color: var(--muted); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 12px; padding: 12px 16px 16px; }
+  .panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; min-width: 0; }
+  .panel h2 { font-size: 13px; margin: 0 0 2px; }
+  .panel p { color: var(--muted); margin: 0 0 6px; font-size: 12px; }
+  canvas { width: 100%; height: 240px; display: block; }
+  .wide { grid-column: 1 / -1; }
+  .wide canvas { height: 200px; }
+  table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  td { padding: 3px 4px; border-bottom: 1px solid var(--line); }
+  td:first-child { color: var(--muted); }
+  td:last-child { text-align: right; }
+  .key { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font-size: 12px; margin-top: 4px; }
+  .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 4px; vertical-align: -1px; }
+</style>
+</head>
+<body>
+<header><h1>Pointer diagnostic: 3-D hand to 2-D cursor</h1><span id="status">waiting for the tracker…</span></header>
+<div class="grid">
+  <div class="panel"><h2>1. Top view: camera and hand</h2><p>Camera at the top. The hand's distance and side-to-side position in cm. Reaching toward the screen moves the dot down and up here; it must not move the cursor.</p><canvas id="top"></canvas></div>
+  <div class="panel"><h2>2. Front view: the hand in the pad</h2><p>The hand's real position in cm (pink), inside the pad that spans the screen. The cross is the centre ("recenter" moves it).</p><canvas id="front"></canvas></div>
+  <div class="panel"><h2>3. Screen: every stage</h2><p>Where each stage would put the cursor. Gaps between dots show what each stage adds: jumps, smoothing lag, the lock.</p><canvas id="screen"></canvas>
+    <div class="key"><span><i class="dot" style="background:var(--raw)"></i>mapped</span><span><i class="dot" style="background:var(--desp)"></i>after jump filter</span><span><i class="dot" style="background:var(--filt)"></i>after smoothing</span><span><i class="dot" style="background:var(--cur)"></i>cursor</span><span><i class="dot" style="background:var(--lock)"></i>locked control</span></div></div>
+  <div class="panel"><h2>Numbers</h2><table id="nums"></table></div>
+  <div class="panel wide"><h2>4. Over time (last 6 s)</h2><p>Screen X and Y: mapped (grey) against the cursor (green). Distance in cm (pink, right scale). A grey spike the green ignores is a jump filtered out; green trailing grey is lag.</p><canvas id="strip"></canvas></div>
+</div>
+<script>
+// All drawing is in CSS pixels on canvases sized to their box times devicePixelRatio (the trace page's
+// Retina bug, found live, is avoided by sizing both the buffer and the CSS box).
+const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+const C = {};
+for (const id of ['top', 'front', 'screen', 'strip']) C[id] = document.getElementById(id);
+function prep(c) {
+  const r = c.getBoundingClientRect(), d = devicePixelRatio;
+  if (c.width !== Math.round(r.width * d) || c.height !== Math.round(r.height * d)) { c.width = Math.round(r.width * d); c.height = Math.round(r.height * d); }
+  const g = c.getContext('2d'); g.setTransform(d, 0, 0, d, 0, 0); g.clearRect(0, 0, r.width, r.height);
+  return [g, r.width, r.height];
+}
+let last = null, hist = [], trail = { hand: [], cur: [], raw: [] };
+const es = new EventSource('/diag/stream');
+es.onmessage = e => {
+  const p = JSON.parse(e.data); last = p; p.wall = performance.now();
+  hist.push(p); const cut = p.wall - 6000; while (hist.length && hist[0].wall < cut) hist.shift();
+  if (p.metric) { trail.hand.push(p.metric); if (trail.hand.length > 90) trail.hand.shift(); }
+  if (p.cursor) { trail.cur.push(p.cursor); if (trail.cur.length > 90) trail.cur.shift(); }
+  if (p.raw) { trail.raw.push(p.raw); if (trail.raw.length > 90) trail.raw.shift(); }
+};
+es.onerror = () => { document.getElementById('status').textContent = 'no connection to trace/serve.py'; };
+function dot(g, x, y, r, col, fill = true) { g.beginPath(); g.arc(x, y, r, 0, 7); if (fill) { g.fillStyle = col; g.fill(); } else { g.strokeStyle = col; g.lineWidth = 2; g.stroke(); } }
+function path(g, pts, map, col, w = 1.5) { if (pts.length < 2) return; g.strokeStyle = col; g.lineWidth = w; g.beginPath(); pts.forEach((p, i) => { const [x, y] = map(p); i ? g.lineTo(x, y) : g.moveTo(x, y); }); g.stroke(); }
+function label(g, text, x, y, col = css('--muted')) { g.fillStyle = col; g.font = '11px -apple-system, system-ui'; g.fillText(text, x, y); }
+function drawTop() {
+  const [g, W, H] = prep(C.top); const p = last; if (!p) return;
+  // x: -40..40 cm across, z: 0..90 cm from the camera
+  const sx = x => W / 2 + x / 80 * W, sz = z => 18 + z / 90 * (H - 30);
+  g.strokeStyle = css('--line'); g.lineWidth = 1;
+  for (let z = 20; z <= 80; z += 20) { g.beginPath(); g.moveTo(0, sz(z)); g.lineTo(W, sz(z)); g.stroke(); label(g, `${z} cm`, 4, sz(z) - 3); }
+  g.fillStyle = css('--fg'); g.fillRect(W / 2 - 14, 4, 28, 8); label(g, 'camera', W / 2 + 18, 12, css('--fg'));
+  g.strokeStyle = css('--line'); g.beginPath(); g.moveTo(W / 2, 12); g.lineTo(sx(-40 * 0.7), sz(90)); g.moveTo(W / 2, 12); g.lineTo(sx(40 * 0.7), sz(90)); g.stroke();
+  if (p.metric && p.dist_cm) {
+    const X = p.metric[0], Z = p.dist_cm;
+    if (p.pad && p.centre) { g.fillStyle = 'rgba(244,114,182,.10)'; g.fillRect(sx(p.centre[0] - p.pad[0] / 2), 0, p.pad[0] / 80 * W, H); }
+    dot(g, sx(X), sz(Z), 7, css('--hand'));
+    label(g, `${X.toFixed(1)} cm across, ${Z.toFixed(0)} cm away`, 8, H - 6, css('--fg'));
+  } else label(g, p.mode === 'metric' ? 'no hand' : `mode ${p.mode}: no 3-D position (use map metric)`, 8, H - 6);
+}
+function drawFront() {
+  const [g, W, H] = prep(C.front); const p = last; if (!p) return;
+  if (!(p.pad && p.centre)) { label(g, 'metric mode only', 8, 20); return; }
+  const [pw, ph] = p.pad, [cx, cy] = p.centre, span = Math.max(pw / W, ph / H) * 1.35;
+  const mx = x => W / 2 + (x - cx) / span, my = y => H / 2 + (y - cy) / span;
+  g.strokeStyle = css('--hand'); g.lineWidth = 1.5; g.strokeRect(mx(cx - pw / 2), my(cy - ph / 2), pw / span, ph / span);
+  label(g, `pad ${pw} × ${ph} cm`, mx(cx - pw / 2), my(cy - ph / 2) - 5);
+  g.strokeStyle = css('--muted'); g.beginPath(); g.moveTo(mx(cx) - 8, my(cy)); g.lineTo(mx(cx) + 8, my(cy)); g.moveTo(mx(cx), my(cy) - 8); g.lineTo(mx(cx), my(cy) + 8); g.stroke();
+  path(g, trail.hand, q => [mx(q[0]), my(q[1])], 'rgba(244,114,182,.5)');
+  if (p.metric) { dot(g, mx(p.metric[0]), my(p.metric[1]), 6, css('--hand'));
+    label(g, `${(p.metric[0] - cx).toFixed(1)} cm right, ${(p.metric[1] - cy).toFixed(1)} cm down of centre`, 8, H - 6, css('--fg')); }
+}
+function drawScreen() {
+  const [g, W, H] = prep(C.screen); const p = last; if (!p) return;
+  const [sw, sh] = p.screen, s = Math.min((W - 8) / sw, (H - 8) / sh), ox = (W - sw * s) / 2, oy = (H - sh * s) / 2;
+  const m = q => [ox + q[0] * s, oy + q[1] * s];
+  g.strokeStyle = css('--line'); g.lineWidth = 1; g.strokeRect(ox, oy, sw * s, sh * s);
+  if (p.lock_frame) { const [x, y, w, h] = p.lock_frame; g.strokeStyle = css('--lock'); g.lineWidth = 2; g.strokeRect(ox + x * s, oy + y * s, Math.max(3, w * s), Math.max(3, h * s)); }
+  path(g, trail.raw, m, 'rgba(154,163,173,.45)', 1);
+  path(g, trail.cur, m, 'rgba(52,211,153,.6)', 1.5);
+  if (p.raw) dot(g, ...m(p.raw), 4, css('--raw'));
+  if (p.despiked) dot(g, ...m(p.despiked), 4, css('--desp'));
+  if (p.filtered) dot(g, ...m(p.filtered), 5, css('--filt'));
+  if (p.cursor) dot(g, ...m(p.cursor), 7, css('--cur'), !p.locked);
+  if (p.locked && p.cursor) dot(g, ...m(p.cursor), 7, css('--cur'), false);
+}
+function drawStrip() {
+  const [g, W, H] = prep(C.strip); if (!hist.length) return;
+  const now = hist[hist.length - 1].wall, tx = t => W - (now - t) / 6000 * W;
+  const sw = hist[hist.length - 1].screen[0], sh = hist[hist.length - 1].screen[1];
+  const lanes = [{ name: 'screen X', k: 0, max: sw, y0: 0 }, { name: 'screen Y', k: 1, max: sh, y0: H / 2 }];
+  for (const L of lanes) {
+    const y = v => L.y0 + 8 + (v / L.max) * (H / 2 - 16);
+    g.strokeStyle = css('--line'); g.strokeRect(0, L.y0 + 4, W, H / 2 - 8); label(g, L.name, 6, L.y0 + 16);
+    for (const [key, col, w] of [['raw', 'rgba(154,163,173,.8)', 1], ['cursor', css('--cur'), 1.6]]) {
+      g.strokeStyle = col; g.lineWidth = w; g.beginPath(); let started = false;
+      for (const p of hist) { if (!p[key]) { started = false; continue; } const X = tx(p.wall), Y = y(p[key][L.k]); started ? g.lineTo(X, Y) : g.moveTo(X, Y); started = true; }
+      g.stroke();
+    }
+  }
+  const zs = hist.filter(p => p.dist_cm); if (zs.length > 1) {
+    const zy = z => H - 6 - (z - 20) / 70 * (H - 12);
+    g.strokeStyle = css('--hand'); g.lineWidth = 1.2; g.beginPath(); zs.forEach((p, i) => i ? g.lineTo(tx(p.wall), zy(p.dist_cm)) : g.moveTo(tx(p.wall), zy(p.dist_cm))); g.stroke();
+    label(g, `distance ${zs[zs.length - 1].dist_cm} cm`, W - 120, H - 8, css('--hand'));
+  }
+}
+function numbers() {
+  const p = last; if (!p) return;
+  const f = (v, d = 1, u = '') => v == null ? '–' : `${(+v).toFixed(d)}${u}`;
+  const off = (a, b) => a && b ? Math.hypot(a[0] - b[0], a[1] - b[1]).toFixed(0) + ' px' : '–';
+  const rows = [
+    ['frame rate', f(p.fps, 1, ' fps')], ['detect', f(p.det, 1, ' ms')], ['hand', p.hand ? 'tracked' : p.state],
+    ['anchor / mapping', `${p.point} / ${p.mode}`],
+    ['hand across, down (cm)', p.metric ? `${f(p.metric[0])}, ${f(p.metric[1])}` : '–'],
+    ['distance from camera', f(p.dist_cm, 0, ' cm')], ['scale', f(p.px_per_m, 0, ' px/m')],
+    ['mapped → cursor', off(p.raw, p.cursor)], ['smoothing lag', off(p.despiked, p.filtered)],
+    ['locked', p.locked ? `yes${p.lock_frame ? ' on a control' : ''}` : 'no'], ['under the cursor', p.under || '–'],
+    ['pinch', p.pinch ? `closed (${f(p.pinch_m * 100, 1, ' cm')})` : (p.pinch_m != null ? `open (${f(p.pinch_m * 100, 1, ' cm')})` : '–')],
+    ['grab', p.grab ? `turning ${f(p.grab_dy, 0, ' px')}` : 'no'],
+  ];
+  document.getElementById('nums').innerHTML = rows.map(r => `<tr><td>${r[0]}</td><td>${r[1]}</td></tr>`).join('');
+  document.getElementById('status').textContent = p.hand ? 'live' : `live, ${p.state}`;
+}
+(function loop() { try { drawTop(); drawFront(); drawScreen(); drawStrip(); numbers(); } catch (e) { console.error(e); } requestAnimationFrame(loop); })();
+</script>
+</body>
+</html>
