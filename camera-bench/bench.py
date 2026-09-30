@@ -209,6 +209,7 @@ class Nudge:
         return aim
 
 
+GRAB_HAND_PX = 1.5           # aim-mode drags: screen px per camera px of the hand's base (x grab gain); ~6 cm = a fader
 TAP_S = 0.4                  # the finger gun: a trigger press shorter than this that did not grab is a click
 REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
 
@@ -2152,7 +2153,14 @@ def main():
                     hover = target
                     # the unlocked filtered position: what a grab drags by (in aim mode the aim itself: the nudge
                     # holds the cursor still while a pinch forms, and a drag must still follow the hand)
-                    free = smooth if isinstance(mapper, AimMap) else pos
+                    if isinstance(mapper, AimMap):
+                        # a drag follows the hand's base (wrist and knuckles, the steadiest point), not the aim: the ray
+                        # magnifies every wobble, and a fader grab jumped 841 px (user, live: "freaking all over the place")
+                        bx = sum(lm[k][0] for k in AIM_THROUGH["base"]) / 5
+                        by = sum(lm[k][1] for k in AIM_THROUGH["base"]) / 5
+                        free = (-bx * cw * GRAB_HAND_PX, by * ch * GRAB_HAND_PX)
+                    else:
+                        free = pos
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
                                       grab_at=click_at if held_down else None, target=target)
                     if probe and not grab.active:
