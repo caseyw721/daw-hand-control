@@ -1597,8 +1597,8 @@ def main():
                 cv2.imshow("camera bench (q quits)", disp)
                 key = cv2.waitKey(1) & 0xFF
                 slow.append(("preview", time.perf_counter() - t_pv))
-                if key == ord("q"):
-                    break
+                if key == ord("q") and not args.control:
+                    break                       # driven by the gesture program (--control), keys typed into the preview never quit it (found live)
             elif overlay.win is not None:
                 overlay.pump()                  # no preview window runs AppKit's events: do it here
             worst = max(slow, key=lambda x: x[1])
