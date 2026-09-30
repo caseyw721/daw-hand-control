@@ -97,6 +97,23 @@ def lead_gain(speed, v0=150.0, v1=500.0):
     return min(max((speed - v0) / (v1 - v0), 0.0), 1.0)
 
 
+def enhance(bgr, clahe):
+    """Low-light correction before detection: grey-world white balance (a red-lit room turns neutral),
+    then CLAHE on the lightness channel (dim hands gain contrast without blowing out lamps).
+    Works on a half-size frame: the landmark model downsamples to ~224 px anyway and landmarks are
+    normalised, so nothing is lost, and it costs a few ms instead of ~20."""
+    import cv2
+    import numpy as np
+    h, w = bgr.shape[:2]
+    small = cv2.resize(bgr, (w // 2, h // 2), interpolation=cv2.INTER_AREA)
+    means = cv2.mean(small)[:3]
+    gains = np.array(means).mean() / (np.array(means) + 1e-3)
+    balanced = cv2.transform(small, np.diag(gains).astype(np.float32))
+    lab = cv2.cvtColor(balanced, cv2.COLOR_BGR2LAB)
+    l, a, b = cv2.split(lab)
+    return cv2.cvtColor(cv2.merge((clahe.apply(l), a, b)), cv2.COLOR_LAB2BGR)
+
+
 class Pinch:
     """Hysteresis on a closeness measure: below `on` for `min_frames` frames closes, above `off`
     for `off_frames` frames opens. Works on the world distance (metres) or the 2-D ratio."""
@@ -461,6 +478,10 @@ def main():
     ap.add_argument("--dump", help="directory: at each drop-out save the last frame with a hand and the first without")
     ap.add_argument("--frames", metavar="PATH", help="write every frame's landmarks as one JSON line to PATH ('-' = stdout), for the gesture engine")
     ap.add_argument("--hands", type=int, default=1, help="hands to track (2 for two-hand gestures; costs detect time)")
+    ap.add_argument("--enhance", action="store_true",
+                    help="low light: neutralise a colour cast (grey world) and lift contrast (CLAHE) before detection; "
+                         "the preview shows the corrected image")
+    ap.add_argument("--detection", type=float, default=0.5, help="MediaPipe min hand detection confidence (lower finds a hand sooner in poor light)")
     ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
 
@@ -502,12 +523,13 @@ def main():
         base_options=mpt.BaseOptions(model_asset_path=args.model, delegate=mpt.BaseOptions.Delegate.CPU),
         running_mode=vision.RunningMode.VIDEO,
         num_hands=args.hands,
-        min_hand_detection_confidence=0.5,
+        min_hand_detection_confidence=args.detection,
         min_hand_presence_confidence=args.presence,
         min_tracking_confidence=args.tracking,
     )
     landmarker = vision.HandLandmarker.create_from_options(opts)
     frames_out = FrameWriter(args.frames, cw, ch) if args.frames else None
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8)) if args.enhance else None
 
     log_file = open(args.log, "w", newline="") if args.log else None
     log = csv.writer(log_file) if log_file else None
@@ -539,6 +561,8 @@ def main():
                 cap.set(cv2.CAP_PROP_FPS, args.fps)
                 pinned = True
             frames += 1
+            if args.enhance:
+                frame = enhance(frame, clahe)
             rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             res = landmarker.detect_for_video(img, int((t_frame - t0) * 1000))
@@ -634,14 +658,18 @@ def main():
                               f"{ratio:.3f}", f"{dist:.4f}", int(pinch.closed), int(state == "held")])
 
             if args.preview:
-                if hand:
-                    for p in res.hand_landmarks[0]:
-                        cv2.circle(frame, (int(p.x * cw), int(p.y * ch)), 3, (0, 255, 0), -1)
+                fh, fw = frame.shape[:2]          # the corrected frame is half size with --enhance
+                for lm in (res.hand_landmarks or []):
+                    for p in lm:
+                        cv2.circle(frame, (int(p.x * fw), int(p.y * fh)), 3, (0, 255, 0), -1)
                 disp = cv2.flip(frame, 1)
                 if isinstance(mapper, AbsoluteMap):
                     x0, y0, x1, y1 = mapper.rect
-                    cv2.rectangle(disp, (int((1 - x1) * cw), int(y0 * ch)), (int((1 - x0) * cw), int(y1 * ch)),
+                    cv2.rectangle(disp, (int((1 - x1) * fw), int(y0 * fh)), (int((1 - x0) * fw), int(y1 * fh)),
                                   (0, 200, 255), 2)
+                found = "HAND" if hand else ("HAND (held)" if state == "held" else "NO HAND")
+                colour = (0, 220, 0) if hand else ((0, 200, 255) if state == "held" else (0, 0, 255))
+                cv2.putText(disp, found, (16, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.1, colour, 3)
                 label = "CALIBRATING: sweep your range" if calibrating else ("PINCH" if pinch.closed else "")
                 if label:
                     cv2.putText(disp, label, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
