@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Cursor Trace Test</title>
+<style>
+  :root { --bg: #111418; --fg: #e8eaed; --muted: #8a9099; --path: #3b82f6; --start: #22c55e; --end: #ef4444; --trail: #fbbf24; --panel: #1b2027; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; cursor: crosshair; }
+  canvas { position: fixed; inset: 0; }
+  #hud { position: fixed; top: 14px; left: 16px; right: 16px; display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
+  #task { font-size: 20px; font-weight: 600; }
+  #hint { color: var(--muted); max-width: 60ch; }
+  #results { position: fixed; bottom: 16px; left: 16px; background: var(--panel); border-radius: 8px; padding: 10px 14px; font-variant-numeric: tabular-nums; max-height: 45vh; overflow: auto; }
+  #results table { border-collapse: collapse; }
+  #results td, #results th { padding: 2px 10px; text-align: right; }
+  #results th:first-child, #results td:first-child { text-align: left; }
+  #keys { position: fixed; bottom: 16px; right: 16px; color: var(--muted); }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud"><div><div id="task"></div><div id="hint"></div></div><div id="live"></div></div>
+<div id="results"></div>
+<div id="keys">R restart this task · N next · A all again</div>
+<script>
+// Each task: the cursor rests in the green dot to start (like the hover lock), follows the blue path,
+// and ends in the red dot. Deviation is the perpendicular distance from the path; jitter is the
+// RMS of the second difference of the cursor track (how shaky, independent of where it is).
+const c = document.getElementById('c'), g = c.getContext('2d');
+let W, H;
+function size() { W = c.width = innerWidth * devicePixelRatio; H = c.height = innerHeight * devicePixelRatio; g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); }
+addEventListener('resize', () => { size(); draw(); }); size();
+const w = () => innerWidth, h = () => innerHeight;
+const TASKS = [
+  { name: 'Hold still', hint: 'Rest the cursor on the dot for 3 seconds.', hold: true, pts: () => [[w() / 2, h() / 2]] },
+  { name: 'Horizontal', hint: 'Left to right along the line (tests vertical steadiness).', pts: () => [[w() * .15, h() / 2], [w() * .85, h() / 2]] },
+  { name: 'Vertical', hint: 'Top to bottom along the line (tests horizontal steadiness).', pts: () => [[w() / 2, h() * .18], [w() / 2, h() * .85]] },
+  { name: 'Diagonal down', hint: 'Top-left to bottom-right.', pts: () => [[w() * .2, h() * .2], [w() * .8, h() * .82]] },
+  { name: 'Diagonal up', hint: 'Bottom-left to top-right.', pts: () => [[w() * .2, h() * .82], [w() * .8, h() * .2]] },
+  { name: 'Box', hint: 'Around the box, clockwise from the top-left corner.', pts: () => { const x0 = w() * .25, x1 = w() * .75, y0 = h() * .22, y1 = h() * .78; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]; } },
+];
+let ti = 0, state = 'wait', restSince = null, track = [], results = [], mouse = null;
+const R = 26;
+function dist(a, b) { return Math.hypot(a[0] - b[0], a[1] - b[1]); }
+function segDist(p, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1], L = dx * dx + dy * dy;
+  let t = L ? ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / L : 0; t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p[0] - (a[0] + t * dx), p[1] - (a[1] + t * dy));
+}
+function pathDist(p, pts) { if (pts.length === 1) return dist(p, pts[0]); let m = Infinity; for (let i = 1; i < pts.length; i++) m = Math.min(m, segDist(p, pts[i - 1], pts[i])); return m; }
+function metrics(task, tr) {
+  const pts = task.pts(), dev = tr.map(p => pathDist([p.x, p.y], pts));
+  const rms = Math.sqrt(dev.reduce((s, d) => s + d * d, 0) / dev.length), max = Math.max(...dev);
+  let j = 0, n = 0;
+  for (let i = 2; i < tr.length; i++) { const ax = tr[i].x - 2 * tr[i - 1].x + tr[i - 2].x, ay = tr[i].y - 2 * tr[i - 1].y + tr[i - 2].y; j += ax * ax + ay * ay; n++; }
+  const secs = (tr[tr.length - 1].t - tr[0].t) / 1000;
+  let len = 0; for (let i = 1; i < tr.length; i++) len += Math.hypot(tr[i].x - tr[i - 1].x, tr[i].y - tr[i - 1].y);
+  return { task: task.name, rms: +rms.toFixed(1), max: +max.toFixed(1), jitter: +(n ? Math.sqrt(j / n) : 0).toFixed(2), secs: +secs.toFixed(2), speed: +(len / Math.max(secs, 1e-3)).toFixed(0), samples: tr.length, rate: +(tr.length / Math.max(secs, 1e-3)).toFixed(1) };
+}
+function save(r) {
+  fetch('/result', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ...r, when: new Date().toISOString(), screen: [w(), h()] }) }).catch(() => {});
+}
+function finish() {
+  const r = metrics(TASKS[ti], track); results.push(r); save(r); renderResults();
+  state = 'done'; setTimeout(() => { if (ti < TASKS.length - 1) { ti++; reset(); } else { state = 'all'; draw(); } }, 900);
+}
+function reset() { state = 'wait'; restSince = null; track = []; draw(); }
+function renderResults() {
+  const rows = results.map(r => `<tr><td>${r.task}</td><td>${r.rms}</td><td>${r.max}</td><td>${r.jitter}</td><td>${r.secs}</td><td>${r.rate}</td></tr>`).join('');
+  document.getElementById('results').innerHTML = results.length ? `<table><tr><th>task</th><th>off path rms px</th><th>max px</th><th>jitter px</th><th>s</th><th>moves/s</th></tr>${rows}</table>` : '';
+}
+addEventListener('pointermove', e => {
+  const now = performance.now(); mouse = [e.clientX, e.clientY];
+  const task = TASKS[ti], pts = task.pts();
+  if (state === 'wait') {
+    if (dist(mouse, pts[0]) < R) { restSince = restSince ?? now; if (now - restSince > 300) { state = 'go'; track = [{ x: mouse[0], y: mouse[1], t: now }]; } }
+    else restSince = null;
+  } else if (state === 'go') {
+    track.push({ x: mouse[0], y: mouse[1], t: now });
+    if (task.hold) { if (now - track[0].t >= 3000) finish(); }
+    else if (dist(mouse, pts[pts.length - 1]) < R && track.length > 10) finish();
+  }
+  draw();
+});
+addEventListener('keydown', e => {
+  if (e.key === 'r' || e.key === 'R') reset();
+  if (e.key === 'n' || e.key === 'N') { ti = (ti + 1) % TASKS.length; reset(); }
+  if (e.key === 'a' || e.key === 'A') { ti = 0; results = []; renderResults(); reset(); }
+});
+function draw() {
+  g.clearRect(0, 0, w(), h());
+  const task = TASKS[ti], pts = task.pts();
+  document.getElementById('task').textContent = state === 'all' ? 'Done: all results saved' : `${ti + 1}/${TASKS.length}  ${task.name}`;
+  document.getElementById('hint').textContent = state === 'wait' ? `${task.hint} Rest in the green dot to start.` : state === 'go' ? (task.hold ? 'Hold…' : 'Follow the line to the red dot.') : '';
+  g.lineWidth = 3; g.strokeStyle = getComputedStyle(document.body).getPropertyValue('--path');
+  if (pts.length > 1) { g.beginPath(); g.moveTo(...pts[0]); for (const p of pts.slice(1)) g.lineTo(...p); g.stroke(); }
+  g.fillStyle = '#22c55e'; g.beginPath(); g.arc(...pts[0], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1;
+  if (pts.length > 1) { g.fillStyle = '#ef4444'; g.beginPath(); g.arc(...pts[pts.length - 1], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1; }
+  if (track.length > 1) { g.strokeStyle = '#fbbf24'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(track[0].x, track[0].y); for (const p of track) g.lineTo(p.x, p.y); g.stroke(); }
+  if (mouse) { document.getElementById('live').textContent = `off path ${pathDist(mouse, pts).toFixed(0)} px`; }
+}
+draw();
+</script>
+</body>
+</html>
