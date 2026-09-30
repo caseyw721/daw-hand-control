@@ -759,45 +759,53 @@ DRAG_ROLES = {"AXSlider", "AXIncrementor", "AXValueIndicator", "AXLevelIndicator
 
 
 class Grab:
-    """The grab session (user's design, 2026-09-29): pinch and hold on a knob or slider, the tracker presses
-    the mouse there after `hold_s` (a quick pinch never presses: pinches stay gestures), vertical hand
-    movement drags it (`gain` px of drag per px of free cursor movement), and releasing the pinch lets go
-    and puts the cursor back where the grab began. mode: off; drag = only on sliders/knobs Accessibility
-    reports; any = anywhere (for plug-in GUIs that hide their knobs from Accessibility)."""
+    """The grab session (user's design, 2026-09-29): pinch and hold (or close the hand) on a knob or slider, the
+    tracker presses the mouse there after `hold_s` (a quick pinch never presses: pinches stay gestures), hand
+    movement drags it both ways like a real mouse (`gain` px of drag per px of free cursor movement), and letting go
+    releases and puts the cursor back where the grab began. Both ways because each control reads its own direction:
+    Logic's knobs and its tempo display turn with vertical drags, the track header's volume slider moves sideways
+    (user, live: "we don't have a horizontal drag yet, just vertical drag"). mode: off; drag = only on sliders and
+    knobs Accessibility reports; any = anywhere (plug-in GUIs that hide their knobs from Accessibility).
+    `hand` is the free cursor position (x, y), or a bare y for a vertical-only caller."""
 
     def __init__(self, mode="off", gain=0.6, hold_s=0.25):
         self.mode, self.gain, self.hold_s = mode, gain, hold_s
         self.reset()
 
     def reset(self):
-        self.at = self.t0 = self.y0 = None
+        self.at = self.t0 = self.h0 = None
         self.active = self.allowed = False
-        self.dy = 0.0
+        self.dx = self.dy = 0.0
 
-    def begin(self, at, t, y, role):
+    @staticmethod
+    def _xy(hand):
+        return (0.0, float(hand)) if not isinstance(hand, (tuple, list)) else (float(hand[0]), float(hand[1]))
+
+    def begin(self, at, t, hand, role):
         self.reset()
-        self.at, self.t0, self.y0 = at, t, y
+        self.at, self.t0, self.h0 = at, t, self._xy(hand)
         self.allowed = self.mode == "any" or (self.mode == "drag" and role in DRAG_ROLES)
 
-    def step(self, t, y):
-        """('press', x, y) once the hold has lasted, then ('drag', x, y, ddy) as the hand moves; else None."""
+    def step(self, t, hand):
+        """('press', x, y) once the hold has lasted, then ('drag', x, y, ddx, ddy) as the hand moves; else None."""
         if self.at is None or not self.allowed:
             return None
+        hx, hy = self._xy(hand)
         if not self.active:
             if t - self.t0 >= self.hold_s:
-                self.active, self.y0, self.dy = True, y, 0.0
+                self.active, self.h0, self.dx, self.dy = True, (hx, hy), 0.0, 0.0
                 return ("press", self.at[0], self.at[1])
             return None
-        dy = (y - self.y0) * self.gain
-        ddy = dy - self.dy
-        if abs(ddy) < 0.5:
+        dx, dy = (hx - self.h0[0]) * self.gain, (hy - self.h0[1]) * self.gain
+        ddx, ddy = dx - self.dx, dy - self.dy
+        if abs(ddx) < 0.5 and abs(ddy) < 0.5:
             return None
-        self.dy = dy
-        return ("drag", self.at[0], self.at[1] + dy, ddy)
+        self.dx, self.dy = dx, dy
+        return ("drag", self.at[0] + dx, self.at[1] + dy, ddx, ddy)
 
     def end(self):
         """('release', x, y, back_x, back_y) if a press happened, else None; the session is over."""
-        r = ("release", self.at[0], self.at[1] + self.dy, self.at[0], self.at[1]) if self.active else None
+        r = ("release", self.at[0] + self.dx, self.at[1] + self.dy, self.at[0], self.at[1]) if self.active else None
         self.reset()
         return r
 
@@ -1463,20 +1471,20 @@ def main():
                     if grab.mode != "off" and (cursor.enabled or grab.at is not None):   # no grabs while hands are off
                         if held_down and cursor.enabled:
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
-                            grab.begin(pos, t_det, free[1], role)
+                            grab.begin(pos, t_det, free, role)
                         if held and grab.at is not None:
-                            a = grab.step(t_det, free[1])
+                            a = grab.step(t_det, free)
                             if a and a[0] == "press":
                                 cursor.press(a[1], a[2])
                                 print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f}", file=sys.stderr, flush=True)
                             elif a and a[0] == "drag":
-                                cursor.drag(a[1], a[2], 0, a[3])
+                                cursor.drag(a[1], a[2], a[3], a[4])
                         elif grab.at is not None and not held:
                             r = grab.end()
                             if r:
                                 cursor.release(r[1], r[2])
                                 cursor.warp(r[3], r[4])
-                                print(f"I,grab,release,{r[2] - r[4]:+.0f}px", file=sys.stderr, flush=True)
+                                print(f"I,grab,release,{r[2] - r[4]:+.0f}px,{r[1] - r[3]:+.0f}px across", file=sys.stderr, flush=True)
                     if event == "down":
                         click_at = pos
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
@@ -1508,7 +1516,7 @@ def main():
                     r = grab.end()
                     cursor.release(r[1], r[2])
                     cursor.warp(r[3], r[4])
-                    print(f"I,grab,release,{r[2] - r[4]:+.0f}px,hand lost", file=sys.stderr, flush=True)
+                    print(f"I,grab,release,{r[2] - r[4]:+.0f}px,{r[1] - r[3]:+.0f}px across,hand lost", file=sys.stderr, flush=True)
                 grab.reset()
                 last_pos = None
                 if cursor.down:
@@ -1539,7 +1547,7 @@ def main():
                        "locked": lock.at is not None, "lock_frame": None if lock.frame is None else [round(v) for v in lock.frame],
                        "under": probe.label() if probe else "", "pinch": bool(pinch.closed),
                        "pinch_m": None if dist != dist else round(dist, 4),
-                       "grab": grab.active, "grab_dy": round(grab.dy, 1)}
+                       "grab": grab.active, "grab_dy": round(grab.dy, 1), "grab_dx": round(grab.dx, 1)}
                 if isinstance(mapper, MetricMap):
                     pkt["metric"] = None if mapper.last is None else [round(mapper.last[0] * 100, 2), round(mapper.last[1] * 100, 2)]
                     pkt["centre"] = None if mapper.centre is None else [round(mapper.centre[0] * 100, 2), round(mapper.centre[1] * 100, 2)]
@@ -1581,7 +1589,7 @@ def main():
                 on = f" on {probe.label()}" if (probe and lock.frame is not None) else ""
                 label = "CALIBRATING: sweep your range" if calibrating else (
                     "HANDS OFF: say \"hands on\"" if not cursor.enabled else (
-                        f"GRAB: turning {grab.dy:+.0f} px" if grab.active else (
+                        f"GRAB: {grab.dx:+.0f}, {grab.dy:+.0f} px" if grab.active else (
                             "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else ""))))
                 if label:
                     cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
