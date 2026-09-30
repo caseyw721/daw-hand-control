@@ -1573,6 +1573,9 @@ def main():
                     help="aim: the hand point the ray passes through: pip (the index finger's middle joint: 2x steadier than "
                          "the tip and the best calibrations, measured live), base (wrist and knuckles, steadiest, follows "
                          "finger aiming less) or tip (the fingertip itself)")
+    ap.add_argument("--face-prep", choices=["colour", "hand"], default="colour",
+                    help="aim: the image the face tracker sees: colour (the camera's own, full size) or hand (the hand's "
+                         "prepared image, e.g. half-size grey)")
     ap.add_argument("--eye", choices=["mid", "left", "right"], default="mid",
                     help="aim: which eye the ray starts from (mid = between them; the calibration absorbs the dominant eye)")
     ap.add_argument("--pad", type=parse_pair, default=(24.0, 15.0), metavar="W,H",
@@ -1946,6 +1949,7 @@ def main():
                 pinned = True
             frames += 1
             fps_now = rate.tick(t_frame)
+            camera_frame = frame              # the face tracker gets the camera's own image (see below)
             if args.prep == "enhance":
                 frame = enhance(frame, clahe)
             elif args.prep == "gray":
@@ -2286,7 +2290,12 @@ def main():
                 if facer is None:
                     facer = make_facer()
                 t_fc = time.perf_counter()
-                fres = facer.detect_for_video(img, int((t_frame - t0) * 1000))
+                # the camera's own full-size colour image, not the hand's prepared one: the grey prep is half size, and at
+                # 6 ft the eyes were ~20 px apart in it (user, live: "use color ... too dark of an area to register eyes
+                # from more than like six feet away")
+                fimg = img if args.face_prep == "hand" else mp.Image(
+                    image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB))
+                fres = facer.detect_for_video(fimg, int((t_frame - t0) * 1000))
                 face_ms.append((time.perf_counter() - t_fc) * 1000)
                 slow.append(("face", face_ms[-1] / 1000))
                 face = [(p.x, p.y, p.z) for p in fres.face_landmarks[0]] if fres.face_landmarks else None
