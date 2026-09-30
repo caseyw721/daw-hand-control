@@ -642,5 +642,18 @@ for k in range(60):                                  # a long slow move: the cur
 check(not n.on, f"a cursor left more than the leash behind the aim goes back onto it ({out})")
 check(Nudge(gain=0.0)((5, 5), 0.0) == (5, 5) and not Nudge(gain=1.0).enabled, "gain 0 or 1 is off")
 
+# --- rewind: a pinch grabs where the cursor was before the fingers began to close ---
+from bench import rewind_point  # noqa: E402
+hist, hh = [], []
+for k in range(30):                                  # 1 s: resting at (500, 500) with the fingers open, then closing
+    t = k / 30
+    closing = k >= 20
+    x = 500 + (60 * (k - 19) if closing else 0)       # the fingertip (the aim) swings 60 px a frame while closing
+    hist.append((t, x, 500)); hh.append((t, 0.08 - (0.005 * (k - 19) if closing else 0), 0.95))
+check(rewind_point(hist, hh, 29 / 30) == (500, 500), f"the grab goes back to before the pinch began ({rewind_point(hist, hh, 29 / 30)})")
+hh2 = [(t, 0.045 - (0.001 * k if k >= 20 else 0), 0.95) for k, (t, _, _) in enumerate(hist)]   # never over 5.5 cm
+check(rewind_point(hist, hh2, 29 / 30)[0] <= 560, f"with the thumb resting close, the most-open moment is used ({rewind_point(hist, hh2, 29 / 30)})")
+check(rewind_point([], [], 1.0) is None, "nothing to go back to")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

@@ -209,6 +209,39 @@ class Nudge:
         return aim
 
 
+REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
+
+
+def rewind_point(history, hand_hist, t, grip=False, span=REWIND_S, noise=None):
+    """Where the cursor was just before a pinch (or, with `grip`, a closing hand) began, for the grab and the click.
+    In aim mode the ray runs through the fingertip, and closing the fingers moves it: over the 0.4 s before a pinch
+    closed the aim moved 229 px (median) and 957 px (p90) in the first nudge session (user, live: "I can't grab
+    anything because it freaks out and points everywhere"). The pinch's own speed does not separate it from pointing
+    (the user's thumb rests ~6 cm from the tip and pinches close slowly), so instead of predicting it the tracker
+    looks back from the close to where the closing began: the peak of the thumb-to-index distance (or of the hand's
+    openness) within `span` s, walking back until the value falls again by more than `noise`. history: (t, x, y);
+    hand_hist: (t, pinch m, openness). None when there is nothing to go back to."""
+    noise = noise if noise is not None else (0.03 if grip else 0.004)
+    when, most = None, -1.0
+    for (th, dist, opened) in reversed(hand_hist):
+        if t - th > span:
+            break
+        v = opened if grip else dist
+        if v > most:
+            when, most = th, v
+        elif v < most - noise:                   # past the peak: the fingers were closing from there on
+            break
+    if when is None:
+        return None
+    best = None
+    for (tp, x, y) in history:                   # the cursor at (or just before) that moment
+        if tp <= when:
+            best = (x, y)
+        else:
+            break
+    return best
+
+
 class Despike:
     """Median of the last n points: a single-frame landmark glitch never reaches the cursor. Costs
     (n-1)/2 frames of delay; n=1 is off."""
@@ -368,8 +401,6 @@ def rect_distance(p, frame):
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
-NUDGE_FREEZE_PINCH_M = 0.07   # thumb-to-index distance under which a pinch is forming (pinch closes at 0.035)
-NUDGE_FREEZE_OPEN = 0.85      # openness under which a hand is closing (a grip closes at 0.72)
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
@@ -1783,6 +1814,7 @@ def main():
     hover = None                  # the control highlighted last frame (sticky, see STICKY_PX)
     presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
+    hand_hist = collections.deque(maxlen=64)  # (t, pinch m, openness) alongside it, for rewind_point
     calibrating = args.mode == "abs" and args.calibrate > 0
     cal_pts, cal_until = [], None
     facer = None                  # aim mode: the face landmarker, made the first time it is needed
@@ -1988,12 +2020,11 @@ def main():
                         pos = (fx.lead(ahead), fy.lead(ahead))
                     smooth = pos
                     if isinstance(mapper, AimMap) and nudge.enabled:
-                        forming = (not math.isnan(dist) and dist < NUDGE_FREEZE_PINCH_M) or pinch.closed or (
-                            args.grip == "on" and ((not math.isnan(opened) and opened < NUDGE_FREEZE_OPEN) or grip.closed))
-                        pos = nudge(pos, t_det, freeze=forming)
+                        pos = nudge(pos, t_det, freeze=pinch.closed or (args.grip == "on" and grip.closed))
                     else:
                         pos = precision(pos, t_det)
                     history.append((t_det, pos[0], pos[1]))
+                    hand_hist.append((t_det, 1.0 if math.isnan(dist) else dist, 1.0 if math.isnan(opened) else opened))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
                     gevent = grip.update(opened) if not math.isnan(opened) else None
@@ -2009,6 +2040,13 @@ def main():
                     # Heisenberg: the pinch itself nudges the finger; use the position from before it.
                     tb = t_det - args.heisenberg_ms / 1000
                     click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
+                    if held_down and isinstance(mapper, AimMap):
+                        # the pinch moved the fingertip and the aim with it: grab where the cursor was before it began
+                        rw = rewind_point(history, hand_hist, t_det,
+                                          grip=not pinch.closed and args.grip == "on" and grip.closed)
+                        if rw is not None:
+                            print(f"I,rewind,{math.hypot(pos[0] - rw[0], pos[1] - rw[1]):.0f}px", file=sys.stderr, flush=True)
+                            click_at = pos = rw
                     if probe is None and (lock.dwell > 0 or grab.mode != "off" or overlay.ring is not None):
                         probe = AXProbe(zone=args.zone)         # turned on live by `lock <ms> ...` or `grab ...`
                     target = probe.control_at(pos) if probe else None
