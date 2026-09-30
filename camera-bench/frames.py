@@ -80,10 +80,14 @@ class FrameWriter:
         self.thread = threading.Thread(target=self._run, name="frames", daemon=True)
         self.thread.start()
 
-    def write(self, res, state, t_read, t_det, t_capture=None):
+    def write(self, res, state, t_read, t_det, t_capture=None, extra=None):
+        """`extra`: more top-level fields, e.g. {"grab": "active"} while the tracker holds a grab (the gesture engine
+        stands down then)."""
         self.seq += 1
         rec = frame_record(self.seq, res, state, t_read + self.offset, t_det + self.offset, self.w, self.h,
                            t_capture=t_capture)
+        if extra:
+            rec.update(extra)
         try:
             self.q.put_nowait(json.dumps(rec, separators=(",", ":")))
         except queue.Full:

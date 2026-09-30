@@ -230,6 +230,21 @@ class Pinch:
         self.closed, self._run = False, 0
 
 
+FINGER_JOINTS = ((5, 6, 7, 8), (9, 10, 11, 12), (13, 14, 15, 16), (17, 18, 19, 20))   # mcp, pip, dip, tip
+
+
+def openness(wlm):
+    """How straight the straightest of the four fingers is, on world landmarks: tip-to-knuckle distance over the
+    finger's length, 1.0 straight, ~0.45 curled (the gesture engine's `ext`). A closed hand (every finger
+    curled) is under ~0.7: the whole-hand grab (user, live: "just grab it")."""
+    best = 0.0
+    for m, p, d, t in FINGER_JOINTS:
+        seg = math.dist(wlm[p], wlm[m]) + math.dist(wlm[d], wlm[p]) + math.dist(wlm[t], wlm[d])
+        if seg > 1e-9:
+            best = max(best, math.dist(wlm[t], wlm[m]) / seg)
+    return best
+
+
 def pinch_ratio(lm):
     """2-D fallback. lm: list of (x, y, z) normalised image landmarks. Thumb tip to index tip over
     hand size; inflates when the hand tilts towards the camera (the palm foreshortens)."""
@@ -280,6 +295,14 @@ def point_of(lm, which):
     return sum(lm[k][0] for k in ks) / 4, sum(lm[k][1] for k in ks) / 4
 
 
+def rect_distance(p, frame):
+    """Distance in px from point p to the rectangle (x, y, w, h); 0 inside."""
+    x, y, w, h = frame
+    dx = max(x - p[0], 0.0, p[0] - (x + w))
+    dy = max(y - p[1], 0.0, p[1] - (y + h))
+    return math.hypot(dx, dy)
+
+
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
@@ -295,8 +318,9 @@ class Lock:
     does not lock (`anywhere` restores the old rest-anywhere lock). While a grab is held (pinch closed)
     it never releases; a grab that starts unlocked locks where the pointer was just before the pinch."""
 
-    def __init__(self, dwell=0.2, still=120.0, breakout=50.0, anywhere=False):
+    def __init__(self, dwell=0.2, still=120.0, breakout=50.0, anywhere=False, zone=0.0):
         self.dwell, self.still, self.breakout, self.anywhere = dwell, still, breakout, anywhere
+        self.zone = zone           # px around a control that counts as on it (the probe's zone): the lock keeps it too
         self.at = None             # (x, y) while locked
         self.frame = None          # (x, y, w, h) of the control locked onto
         self.still_since = None
@@ -305,8 +329,17 @@ class Lock:
         if self.frame is None:
             return math.hypot(pos[0] - self.at[0], pos[1] - self.at[1]) <= self.breakout
         x, y, w, h = self.frame
-        m = self.breakout
+        m = self.breakout + self.zone
         return x - m <= pos[0] <= x + w + m and y - m <= pos[1] <= y + h + m
+
+    @staticmethod
+    def land(pos, target):
+        """Where a lock on `target` puts the cursor: a small control's centre, else pos pulled inside the frame
+        (with zones the cursor may be up to `zone` px off the control, and a grab must press on the control)."""
+        x, y, w, h = target
+        if w <= SNAP_MAX_PX and h <= SNAP_MAX_PX:
+            return (x + w / 2, y + h / 2)
+        return (min(max(pos[0], x + 1), x + w - 1), min(max(pos[1], y + 1), y + h - 1))
 
     def update(self, pos, t, speed, held=False, grab_at=None, target=None):
         """The position to show for this frame. `target` is the control under the pointer, (x, y, w, h)
@@ -320,7 +353,7 @@ class Lock:
         if held:
             if target is None and not self.anywhere:
                 return pos        # a pinch over nothing does not lock (user, live: "it still locks wherever the pinch is")
-            self.at = grab_at or pos
+            self.at = self.land(grab_at or pos, target) if target is not None else (grab_at or pos)
             self.frame = target
             return self.at
         if self.dwell > 0 and speed < self.still and (target is not None or self.anywhere):
@@ -328,9 +361,7 @@ class Lock:
                 self.still_since = t
             elif t - self.still_since >= self.dwell:
                 if target is not None:
-                    x, y, w, h = target
-                    small = w <= SNAP_MAX_PX and h <= SNAP_MAX_PX
-                    self.at = (x + w / 2, y + h / 2) if small else pos
+                    self.at = self.land(pos, target)
                     self.frame = target
                 else:
                     self.at = pos
@@ -350,10 +381,12 @@ class AXProbe:
     containing pos if one was seen there recently, else None. Without the bindings or the permission it
     stays empty and hover locking simply never engages."""
 
-    def __init__(self, period=0.08):
+    def __init__(self, period=0.08, zone=0.0):
         self.period = period
+        self.zone = zone           # px: a control this close counts as under the cursor (user: "widen the targets")
         self.pos = None
-        self.found = None          # (t, role, (x, y, w, h), title)
+        self.found = None          # (t, role, (x, y, w, h), title, is_control)
+        self.cache = {}            # container key -> (t, [(role, frame, name)]) for the zone search
         self.ok = False
         try:
             import ApplicationServices as AS
@@ -409,6 +442,60 @@ class AXProbe:
                 return prole, pframe, str(self._attr(parent, "AXTitle") or self._attr(parent, "AXDescription") or name), True
         return role, frame, name, False
 
+    def _knob(self, el, frame):
+        """A slider's own thumb when it has one: Logic's volume fader is a 20x180 track with a 22x46 'fader knob'
+        inside (surveyed live), and grabbing or snapping to the track's middle misses the knob."""
+        for k in self._attr(el, "AXChildren") or []:
+            if str(self._attr(k, "AXRole") or "") == "AXValueIndicator":
+                f = self._frame(k)
+                if f and f[2] * f[3] > 0:
+                    return f
+        return frame
+
+    def _controls_in(self, node, depth=3, limit=160):
+        """Controls among a container's descendants: [(role, frame, name)], cached for 2 s per container."""
+        key = (str(self._attr(node, "AXRole") or ""), self._frame(node))
+        hit = self.cache.get(key)
+        if hit and time.monotonic() - hit[0] < 2.0:
+            return hit[1]
+        out, stack, seen = [], [(node, 0)], 0
+        while stack and seen < limit:
+            el, d = stack.pop()
+            seen += 1
+            if d > 0:
+                role, frame, name, is_control = self.classify(el)
+                if is_control and frame and frame[2] * frame[3] <= 300 * 300:
+                    if role == "AXSlider":
+                        frame = self._knob(el, frame)
+                    out.append((role, frame, name))
+                    continue
+            if d < depth:
+                stack.extend((k, d + 1) for k in (self._attr(el, "AXChildren") or []))
+        if len(self.cache) > 64:
+            self.cache.clear()
+        self.cache[key] = (time.monotonic(), out)
+        return out
+
+    def _nearby(self, el, pos):
+        """The nearest control within `zone` px of pos, searching the element under the cursor and up to two of its
+        containers (a mixer channel strip holds its fader, pan and sends), never a whole window."""
+        node = el
+        for _ in range(3):
+            if node is None:
+                break
+            frame = self._frame(node)
+            if frame is None or frame[2] * frame[3] > 500 * 1100:
+                break
+            best = None
+            for role, f, name in self._controls_in(node):
+                d = rect_distance(pos, f)
+                if d <= self.zone and (best is None or d < best[0]):
+                    best = (d, role, f, name)
+            if best:
+                return best[1], best[2], best[3]
+            node = self._attr(node, "AXParent")
+        return None
+
     def _run(self):
         last = None
         while True:
@@ -424,16 +511,23 @@ class AXProbe:
                     self.found = (time.monotonic(), None, None, "", False)
                     continue
                 role, frame, name, is_control = self.classify(el)
+                if is_control and role == "AXSlider" and frame:
+                    frame = self._knob(el, frame)
+                elif not is_control and self.zone > 0:
+                    near = self._nearby(el, pos)
+                    if near:
+                        (role, frame, name), is_control = near, True
                 self.found = (time.monotonic(), role, frame, name, is_control)
             except Exception:
                 self.found = (time.monotonic(), None, None, "", False)
 
     def control_at(self, pos):
+        """The frame of the control under or within `zone` px of pos, if Accessibility saw one there recently."""
         f = self.found
         if not f or not f[4] or f[2] is None or time.monotonic() - f[0] > 0.4:
             return None
         x, y, w, h = f[2]
-        if w * h > 300 * 300 or not (x - 2 <= pos[0] <= x + w + 2 and y - 2 <= pos[1] <= y + h + 2):
+        if w * h > 300 * 300 or rect_distance(pos, f[2]) > self.zone + 2:
             return None
         return f[2]
 
@@ -720,6 +814,105 @@ class Sound:
             subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+class Overlay:
+    """What the user sees instead of a small arrow (user, live: the cursor "should be like a camera button on an
+    iPhone, a round fairly big smooth circle", and every button, knob and fader "should noticeably light up like
+    an overlay when hovered"). Two borderless, click-through windows above everything: a round ring that follows
+    the cursor, and a rounded highlight over the control it is on (brighter once locked, amber while grabbing).
+    Clicks pass through both."""
+
+    IDLE, HOVER, LOCK, GRAB = (1.0, 1.0, 1.0), (0.25, 0.85, 1.0), (0.2, 0.95, 0.55), (1.0, 0.7, 0.15)
+
+    def __init__(self, size=64, enabled=True, pad=6):
+        self.size, self.enabled, self.pad = size, enabled, pad
+        self.ring = self.glow = None
+        self.shown = None
+        if not enabled:
+            return
+        import AppKit
+        import Quartz
+        self.AK, self.Q = AppKit, Quartz
+        app = AppKit.NSApplication.sharedApplication()
+        app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)  # no Dock icon
+        self.sh = int(AppKit.NSScreen.screens()[0].frame().size.height)
+        self.ring = self._window(size, size, radius=size / 2)
+        self.glow = self._window(40, 40, radius=10)
+        self.glow.orderOut_(None)
+        self.style(self.IDLE, None)
+
+    def _window(self, w, h, radius):
+        AK = self.AK
+        from Foundation import NSMakeRect
+        win = AK.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, w, h), AK.NSWindowStyleMaskBorderless, AK.NSBackingStoreBuffered, False)
+        win.setLevel_(AK.NSScreenSaverWindowLevel)
+        win.setOpaque_(False)
+        win.setBackgroundColor_(AK.NSColor.clearColor())
+        win.setIgnoresMouseEvents_(True)
+        win.setHasShadow_(False)
+        win.setCollectionBehavior_(AK.NSWindowCollectionBehaviorCanJoinAllSpaces | AK.NSWindowCollectionBehaviorStationary)
+        view = win.contentView()
+        view.setWantsLayer_(True)
+        layer = view.layer()
+        layer.setCornerRadius_(radius)
+        layer.setMasksToBounds_(True)
+        win.orderFrontRegardless()
+        return win
+
+    def _colour(self, rgb, a):
+        return self.AK.NSColor.colorWithSRGBRed_green_blue_alpha_(rgb[0], rgb[1], rgb[2], a).CGColor()
+
+    def style(self, rgb, fill_alpha):
+        """Ring colour: white idle, blue over a control, green locked, amber grabbing."""
+        key = (rgb, fill_alpha)
+        if self.ring is None or key == self.shown:
+            return
+        self.shown = key
+        Q = self.Q
+        Q.CATransaction.begin()
+        Q.CATransaction.setDisableActions_(True)
+        layer = self.ring.contentView().layer()
+        layer.setBorderWidth_(max(3.0, self.size / 16))
+        layer.setBorderColor_(self._colour(rgb, 0.95))
+        layer.setBackgroundColor_(self._colour(rgb, 0.22 if fill_alpha is None else fill_alpha))
+        glow = self.glow.contentView().layer()
+        glow.setBorderWidth_(3.0)
+        glow.setBorderColor_(self._colour(rgb, 0.95))
+        glow.setBackgroundColor_(self._colour(rgb, 0.18))
+        Q.CATransaction.commit()
+
+    def update(self, pos, target=None, locked=False, grabbing=False, visible=True):
+        """pos: Quartz (top-left) point; target: the hovered control's (x, y, w, h) or None."""
+        if self.ring is None:
+            return
+        if not visible or pos is None:
+            self.ring.orderOut_(None)
+            self.glow.orderOut_(None)
+            self.pump()
+            return
+        self.style(self.GRAB if grabbing else self.LOCK if locked else self.HOVER if target else self.IDLE,
+                   0.45 if grabbing else None)
+        self.ring.setFrameOrigin_((pos[0] - self.size / 2, self.sh - pos[1] - self.size / 2))
+        self.ring.orderFrontRegardless()
+        if target:
+            x, y, w, h = target
+            p = self.pad
+            self.glow.setFrame_display_(((x - p, self.sh - (y + h) - p), (w + 2 * p, h + 2 * p)), False)
+            self.glow.orderFrontRegardless()
+            self.ring.orderFrontRegardless()      # the ring stays on top of the highlight
+        else:
+            self.glow.orderOut_(None)
+        self.pump()
+
+    def pump(self):
+        app = self.AK.NSApp
+        while True:
+            ev = app.nextEventMatchingMask_untilDate_inMode_dequeue_(self.AK.NSEventMaskAny, None, self.AK.NSDefaultRunLoopMode, True)
+            if ev is None:
+                break
+            app.sendEvent_(ev)
+
+
 class Marker:
     """A large black square with a thick white border that follows the pointer, in a borderless,
     click-through window above everything else. For filming latency in slow motion: the frame in
@@ -868,6 +1061,12 @@ def main():
                     help="pinch-and-hold drags the knob or slider under the cursor (drag) or anything (any); a quick "
                          "pinch never presses")
     ap.add_argument("--grab-gain", type=float, default=0.6, help="px of drag per px of hand movement while grabbing")
+    ap.add_argument("--grip", choices=["on", "off"], default="off",
+                    help="a closed hand (every finger curled) grabs like a held pinch (user, live: \"just grab it\")")
+    ap.add_argument("--zone", type=float, default=0.0,
+                    help="px: a control this close to the cursor counts as under it (bigger targets); 0 = only on it")
+    ap.add_argument("--ring", type=int, default=0, metavar="PX",
+                    help="draw a round cursor of this diameter and light up the control under it (0 = off)")
     ap.add_argument("--camera", type=int, default=0)
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
@@ -940,6 +1139,7 @@ def main():
     cursor = Cursor(enabled=not args.no_cursor)
     sound = Sound(enabled=not args.quiet)
     marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
+    overlay = Overlay(size=args.ring or 64, enabled=bool(args.ring))
     sw, sh = cursor.screen()
     def make_mapper(mode):
         if mode == "metric":
@@ -950,7 +1150,7 @@ def main():
     mapper = make_mapper(args.mode)
     nonlocal_state = {}           # requests from the control thread, applied between frames by the main loop
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
-    lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout, anywhere=args.lock_anywhere)
+    lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout, anywhere=args.lock_anywhere, zone=args.zone)
     grab = Grab(args.grab, args.grab_gain)
     diag = None
     if args.diag:
@@ -959,7 +1159,7 @@ def main():
         diag = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
         diag.setblocking(False)
     f_px = (1280 / 2) / math.tan(math.radians(35))       # MacBook camera: ~70 degrees across (for the distance readout)
-    probe = AXProbe() if (args.lock_ms or args.grab != "off") else None
+    probe = AXProbe(zone=args.zone) if (args.lock_ms or args.grab != "off" or args.ring) else None
     if args.lock_ms and not (probe and probe.ok):
         print("I,warning,no Accessibility bindings (pip install pyobjc-framework-ApplicationServices): hover lock off",
               file=sys.stderr, flush=True)
@@ -1016,6 +1216,15 @@ def main():
                         grab.mode = parts[1]
                         if len(parts) == 3:
                             grab.gain = float(parts[2])
+                    elif parts[:1] == ["zone"] and len(parts) == 2:
+                        args.zone = min(max(float(parts[1]), 0.0), 150.0)
+                        lock.zone = args.zone
+                        if probe is not None:
+                            probe.zone, probe.cache = args.zone, {}
+                    elif parts[:1] == ["grip"] and len(parts) == 2 and parts[1] in ("on", "off"):
+                        args.grip = parts[1]
+                    elif parts[:1] == ["ring"] and len(parts) == 2 and (parts[1] in ("on", "off") or parts[1].isdigit()):
+                        nonlocal_state["ring"] = 0 if parts[1] == "off" else (64 if parts[1] == "on" else int(parts[1]))
                     elif parts[:1] == ["lockon"] and len(parts) == 2 and parts[1] in ("controls", "anywhere"):
                         lock.anywhere = parts[1] == "anywhere"
                         lock.reset()
@@ -1026,6 +1235,10 @@ def main():
                     print(f"I,control,ignored,{e}", file=sys.stderr, flush=True)
         threading.Thread(target=control_loop, name="control", daemon=True).start()
     pinch = Pinch(on=args.pinch_on, off=args.pinch_off, min_frames=2, off_frames=3)
+    grip = Pinch(on=0.72, off=0.85, min_frames=3, off_frames=3)    # on openness: every finger curled = a closed hand
+    held_was = False              # a pinch or (with --grip on) a closed hand: what grabs and holds a lock
+    grab_state = None             # "pending" | "active" | None, sent with each frame so the gesture engine stands down
+    pending_frame = None
     presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
     calibrating = args.mode == "abs" and args.calibrate > 0
@@ -1090,6 +1303,10 @@ def main():
                     last_raw = None
                 if nonlocal_state.pop("pad", None) and isinstance(mapper, MetricMap):
                     mapper.pad = (args.pad[0] / 100, args.pad[1] / 100)
+                ring = nonlocal_state.pop("ring", None)
+                if ring is not None:                 # AppKit windows are made and closed on this (the main) thread
+                    overlay.update(None, visible=False)
+                    overlay = Overlay(size=ring or 64, enabled=bool(ring))
                 if nonlocal_state.pop("recenter", None) and isinstance(mapper, MetricMap):
                     mapper.recenter_next = True
                     lock.reset()
@@ -1118,7 +1335,7 @@ def main():
             hand = bool(res.hand_landmarks)
             state = presence.update(hand, t_det)
             if frames_out:
-                frames_out.write(res, state, t_frame, t_det)
+                pending_frame = (res, state, t_frame, t_det)
             if hand and prev_state == "held":
                 held_gaps += 1
             prev_state = state
@@ -1132,7 +1349,7 @@ def main():
                     last_hand_frame, dumps = None, dumps + 1
             raw = pos = q = free = smooth = None
             nx = ny = None
-            ratio = dist = float("nan")
+            ratio = dist = opened = float("nan")
             event = None
             if hand:
                 hands += 1
@@ -1141,6 +1358,7 @@ def main():
                 ratio = pinch_ratio(lm)
                 if res.hand_world_landmarks:
                     dist = pinch_dist([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
+                    opened = openness([(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]])
                 if calibrating:
                     if cal_until is None:
                         cal_until = t_det + args.calibrate
@@ -1172,6 +1390,12 @@ def main():
                     history.append((t_det, pos[0], pos[1]))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
+                    gevent = grip.update(opened) if not math.isnan(opened) else None
+                    if gevent:
+                        print(f"I,grip,{gevent}", file=sys.stderr, flush=True)
+                    held = pinch.closed or (args.grip == "on" and grip.closed)
+                    held_down = held and not held_was
+                    held_was = held
                     if 0 < raw[0] < sw - 1 and 0 < raw[1] < sh - 1:  # clamped at an edge is not "still"
                         sec_raw.append(raw)
                         sec_pos.append(pos)
@@ -1179,28 +1403,28 @@ def main():
                     # Heisenberg: the pinch itself nudges the finger; use the position from before it.
                     tb = t_det - args.heisenberg_ms / 1000
                     click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
-                    if probe is None and (lock.dwell > 0 or grab.mode != "off"):
-                        probe = AXProbe()                       # turned on live by `lock <ms> ...` or `grab ...`
+                    if probe is None and (lock.dwell > 0 or grab.mode != "off" or overlay.ring is not None):
+                        probe = AXProbe(zone=args.zone)         # turned on live by `lock <ms> ...` or `grab ...`
                     target = probe.control_at(pos) if probe else None
                     free = pos                                  # the unlocked filtered position: what a grab drags by
-                    pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=pinch.closed,
-                                      grab_at=click_at if event == "down" else None, target=target)
+                    pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
+                                      grab_at=click_at if held_down else None, target=target)
                     if probe and not grab.active:
                         probe.pos = pos
                     marker.move(*pos)
-                    # the grab session: pinch-and-hold presses, vertical movement drags, release returns the cursor
+                    # the grab session: pinch-and-hold (or a closed hand) presses, vertical movement drags, release returns the cursor
                     if grab.mode != "off":
-                        if event == "down":
-                            role = probe.found[1] if (probe and probe.found) else None
+                        if held_down:
+                            role = probe.found[1] if (probe and probe.found and target is not None) else None
                             grab.begin(pos, t_det, free[1], role)
-                        if pinch.closed and grab.at is not None:
+                        if held and grab.at is not None:
                             a = grab.step(t_det, free[1])
                             if a and a[0] == "press":
                                 cursor.press(a[1], a[2])
                                 print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f}", file=sys.stderr, flush=True)
                             elif a and a[0] == "drag":
                                 cursor.drag(a[1], a[2], 0, a[3])
-                        elif grab.at is not None and not pinch.closed:
+                        elif grab.at is not None and not held:
                             r = grab.end()
                             if r:
                                 cursor.release(r[1], r[2])
@@ -1218,6 +1442,8 @@ def main():
                             cursor.release(*pos)
                     elif not grab.active:
                         cursor.move(*pos)
+                    overlay.update(pos, lock.frame if lock.at is not None else target, locked=lock.at is not None,
+                                   grabbing=grab.active, visible=cursor.enabled)
             elif state == "held":
                 pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
             elif state == "lost":
@@ -1240,6 +1466,14 @@ def main():
                 if pinch.closed:
                     print(f"P,{t_det - t0:.2f},up,lost,0,0", file=sys.stderr, flush=True)
                 pinch.reset()
+                grip.reset()
+                held_was = False
+                overlay.update(None, visible=False)             # the ring vanishing says "hand lost"
+            if frames_out and pending_frame:
+                # written after this frame's grab handling, so the engine sees a released grab on the release frame
+                grab_state = "active" if grab.active else ("pending" if (grab.at is not None and grab.allowed) else None)
+                frames_out.write(*pending_frame, extra={"grab": grab_state} if grab_state else None)
+                pending_frame = None
             t_post = time.perf_counter()
             loop_ms.append((t_post - t_loop) * 1000)
 

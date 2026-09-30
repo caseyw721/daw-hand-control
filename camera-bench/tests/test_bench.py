@@ -352,5 +352,55 @@ gap((100.0, 100.0), 0.0)
 gap((105.0, 100.0), 0.033)
 check(gap((300.0, 300.0), 0.5) == (300.0, 300.0), "after a gap in the frames the cursor starts at the hand's spot")
 
+# --- zones: bigger targets (user, live: "widen the targets ... to the zones") ---
+from bench import rect_distance, openness, Overlay, FINGER_JOINTS  # noqa: E402
+check(rect_distance((5, 5), (0, 0, 10, 10)) == 0, "inside a control is distance 0")
+check(abs(rect_distance((13, 14), (0, 0, 10, 10)) - 5) < 1e-9, "distance to the nearest corner")
+check(rect_distance((-7, 5), (0, 0, 10, 10)) == 7, "distance to the nearest side")
+z = Lock(dwell=0.2, still=120, breakout=15, zone=40)
+t = 0.0
+for _ in range(10):                                   # resting 30 px left of an 18 px send knob, within the zone
+    out = z.update((470.0, 409.0), t, 10.0, target=(500, 400, 18, 18))
+    t += 0.033
+check(out == (509.0, 409.0), f"resting within the zone snaps onto the small control ({out})")
+check(z.update((455.0, 409.0), t, 10.0, target=None) == (509.0, 409.0), "the lock holds anywhere inside the zone")
+check(z.update((440.0, 409.0), t, 10.0, target=None) == (440.0, 409.0), "leaving zone + breakout lets go")
+tall = Lock(dwell=0.2, still=120, breakout=15, zone=40)
+out = tall.update((230.0, 950.0), 0.0, 10.0, held=True, grab_at=(230.0, 950.0), target=(197, 901, 20, 180))
+check(out == (216.0, 950.0), f"a grab next to a tall fader track presses on the track, not beside it ({out})")
+# --- a closed hand ---
+flat = [(0.0, 0.0, 0.0)] * 21
+straight = list(flat)
+for m, p_, d, tip in FINGER_JOINTS:
+    x = 0.02 * m
+    straight[m], straight[p_], straight[d], straight[tip] = (x, 0.0, 0.0), (x, 0.04, 0.0), (x, 0.065, 0.0), (x, 0.085, 0.0)
+check(openness(straight) > 0.99, f"straight fingers are open ({openness(straight):.2f})")
+curled = list(straight)
+for m, p_, d, tip in FINGER_JOINTS:
+    x = 0.02 * m
+    curled[p_], curled[d], curled[tip] = (x, 0.04, 0.0), (x, 0.04, 0.025), (x, 0.02, 0.03)
+check(openness(curled) < 0.72, f"curled fingers are a closed hand ({openness(curled):.2f})")
+half = list(curled)
+m, p_, d, tip = FINGER_JOINTS[0]
+half[p_], half[d], half[tip] = straight[p_], straight[d], straight[tip]
+check(openness(half) > 0.9, "one straight finger is not a closed hand (pointing)")
+Overlay(enabled=False).update((10, 10), (0, 0, 5, 5), locked=True)   # disabled: a no-op, no AppKit needed
+# --- the grab state travels with the frame ---
+import io, json as _json  # noqa: E402
+from frames import FrameWriter  # noqa: E402
+fw = FrameWriter("-", 1280, 720)
+class Keep(io.StringIO):
+    def close(self):                                  # the writer closes its file at the end; keep the text
+        pass
+
+
+buf = Keep()
+fw.f = buf
+fw.write(None, "tracked", 1.0, 1.01, extra={"grab": "active"})
+fw.write(None, "tracked", 1.03, 1.04)
+fw.close()
+recs = [_json.loads(x) for x in buf.getvalue().splitlines()]
+check(recs[0].get("grab") == "active" and "grab" not in recs[1], f"extra fields ride on the frame ({[r.get('grab') for r in recs]})")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)
