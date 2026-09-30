@@ -11,7 +11,7 @@
   #hud { position: fixed; top: 14px; left: 16px; right: 16px; display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
   #task { font-size: 20px; font-weight: 600; }
   #hint { color: var(--muted); max-width: 60ch; }
-  #results { position: fixed; bottom: 16px; left: 16px; background: var(--panel); border-radius: 8px; padding: 10px 14px; font-variant-numeric: tabular-nums; max-height: 45vh; overflow: auto; }
+  #results { position: fixed; top: 64px; right: 16px; background: var(--panel); border-radius: 8px; padding: 10px 14px; font-variant-numeric: tabular-nums; max-height: 28vh; overflow: auto; opacity: .92; }
   #results table { border-collapse: collapse; }
   #results td, #results th { padding: 2px 10px; text-align: right; }
   #results th:first-child, #results td:first-child { text-align: left; }
@@ -34,11 +34,12 @@ addEventListener('resize', () => { size(); draw(); }); size();
 const w = () => innerWidth, h = () => innerHeight;
 const TASKS = [
   { name: 'Hold still', hint: 'Rest the cursor on the dot for 3 seconds.', hold: true, pts: () => [[w() / 2, h() / 2]] },
-  { name: 'Horizontal', hint: 'Left to right along the line (tests vertical steadiness).', pts: () => [[w() * .15, h() / 2], [w() * .85, h() / 2]] },
-  { name: 'Vertical', hint: 'Top to bottom along the line (tests horizontal steadiness).', pts: () => [[w() / 2, h() * .18], [w() / 2, h() * .85]] },
-  { name: 'Diagonal down', hint: 'Top-left to bottom-right.', pts: () => [[w() * .2, h() * .2], [w() * .8, h() * .82]] },
-  { name: 'Diagonal up', hint: 'Bottom-left to top-right.', pts: () => [[w() * .2, h() * .82], [w() * .8, h() * .2]] },
-  { name: 'Box', hint: 'Around the box, clockwise from the top-left corner.', pts: () => { const x0 = w() * .25, x1 = w() * .75, y0 = h() * .22, y1 = h() * .78; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]; } },
+  // targets kept to the middle third of the window (user: "I can't see the red dot", the edges were out of reach)
+  { name: 'Horizontal', hint: 'Left to right along the line (tests vertical steadiness).', pts: () => [[w() * .33, h() / 2], [w() * .67, h() / 2]] },
+  { name: 'Vertical', hint: 'Top to bottom along the line (tests horizontal steadiness).', pts: () => [[w() / 2, h() * .32], [w() / 2, h() * .68]] },
+  { name: 'Diagonal down', hint: 'Top-left to bottom-right.', pts: () => [[w() * .36, h() * .33], [w() * .64, h() * .67]] },
+  { name: 'Diagonal up', hint: 'Bottom-left to top-right.', pts: () => [[w() * .36, h() * .67], [w() * .64, h() * .33]] },
+  { name: 'Box', hint: 'Around the box, clockwise from the top-left corner.', pts: () => { const x0 = w() * .38, x1 = w() * .62, y0 = h() * .35, y1 = h() * .65; return [[x0, y0], [x1, y0], [x1, y1], [x0, y1], [x0, y0]]; } },
 ];
 let ti = 0, state = 'wait', restSince = null, track = [], results = [], mouse = null;
 // The cursor's recent path, drawn everywhere it goes (user request): newest bright, fading out over TRAIL_MS.
@@ -115,8 +116,12 @@ function draw() {
   document.getElementById('hint').textContent = state === 'wait' ? `${task.hint} Rest in the green dot to start.` : state === 'go' ? (task.hold ? 'Hold…' : 'Follow the line to the red dot.') : '';
   g.lineWidth = 3; g.strokeStyle = getComputedStyle(document.body).getPropertyValue('--path');
   if (pts.length > 1) { g.beginPath(); g.moveTo(...pts[0]); for (const p of pts.slice(1)) g.lineTo(...p); g.stroke(); }
-  g.fillStyle = '#22c55e'; g.beginPath(); g.arc(...pts[0], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1;
-  if (pts.length > 1) { g.fillStyle = '#ef4444'; g.beginPath(); g.arc(...pts[pts.length - 1], R, 0, 7); g.globalAlpha = .35; g.fill(); g.globalAlpha = 1; }
+  g.fillStyle = '#22c55e'; g.beginPath(); g.arc(...pts[0], R, 0, 7); g.globalAlpha = .45; g.fill(); g.globalAlpha = 1;
+  if (pts.length > 1) {
+    const e = pts[pts.length - 1];
+    g.fillStyle = '#ef4444'; g.beginPath(); g.arc(...e, R, 0, 7); g.fill();
+    g.strokeStyle = '#ffffff'; g.lineWidth = 3; g.beginPath(); g.arc(...e, R + 3, 0, 7); g.stroke();
+  }
   drawTrail(performance.now());
   if (track.length > 1) { g.strokeStyle = '#fbbf24'; g.lineWidth = 1.5; g.beginPath(); g.moveTo(track[0].x, track[0].y); for (const p of track) g.lineTo(p.x, p.y); g.stroke(); }
   if (mouse) { document.getElementById('live').textContent = `off path ${pathDist(mouse, pts).toFixed(0)} px`; }
