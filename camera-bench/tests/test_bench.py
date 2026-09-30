@@ -273,9 +273,11 @@ toward = cursor_at(m, (0.05, 0.02, 0.35))
 check(abs(toward[0] - start[0]) < 12 and abs(toward[1] - start[1]) < 12,
       f"moving 15 cm toward the camera, off-axis, barely moves the cursor ({start} -> {toward})")
 m2 = MetricMap(1728, 1117, pad=(0.24, 0.15))
+m2.recenter_next = True                        # measure from where the hand is, like saying "recenter"
 cursor_at(m2, (0.0, 0.0, 0.40))
 near = cursor_at(m2, (-0.02, 0.0, 0.40))      # 2 cm to the camera's left = the user's right (mirrored)
 m3 = MetricMap(1728, 1117, pad=(0.24, 0.15))
+m3.recenter_next = True
 cursor_at(m3, (0.0, 0.0, 0.70))
 far = cursor_at(m3, (-0.02, 0.0, 0.70))
 check(abs((near[0] - 1727 / 2) - (far[0] - 1727 / 2)) < 8,
