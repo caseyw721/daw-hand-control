@@ -1010,7 +1010,9 @@ class AimMap:
             b, d = self.w / 2 - a * self.hit[0], self.h / 2 - c * self.hit[1]
             self.map, self.recenter_next = (a, b, c, d), False
         x, y = a * self.hit[0] + b, c * self.hit[1] + d
-        return min(max(x, 0.0), self.w - 1), min(max(y, 0.0), self.h - 1)
+        # not clamped to the screen: a grab drags by the aim's movement, and a fader low on the screen could not be
+        # dragged further down once the aim reached the bottom edge (live). The cursor is clamped where it is posted.
+        return x, y
 
 
 class AimCalibration:
@@ -2204,7 +2206,7 @@ def main():
                         if args.click:
                             cursor.release(*pos)
                     elif not grab.active:
-                        cursor.move(*pos)
+                        cursor.move(min(max(pos[0], 0.0), sw - 1), min(max(pos[1], 0.0), sh - 1))
                     t_ov = time.perf_counter()
                     slow.append(("track", t_ov - t_det))
                     overlay.update(pos, lock.frame if lock.at is not None else target, locked=lock.at is not None,
