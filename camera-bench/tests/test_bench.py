@@ -423,7 +423,7 @@ check(recs[0].get("grab") == "active" and "grab" not in recs[1], f"extra fields 
 from bench import (AIM_DOTS, AimCalibration, AimMap, aim_hit, back_project, eye_centres, EYE_CORNERS,  # noqa: E402
                    IPD_M)
 check(close(aim_hit((0.0, 0.05, 0.6), (0.1, 0.1, 0.3)), (0.2, 0.15)), "a fingertip halfway to the screen doubles the offset")
-check(aim_hit((0.0, 0.0, 0.3), (0.0, 0.0, 0.28)) is None, "a fingertip less than 5 cm in front of the eye aims nowhere")
+check(aim_hit((0.0, 0.0, 0.5), (0.0, 0.0, 0.40)) is None, "a fingertip less than 15 cm in front of the eye aims nowhere")
 check(aim_hit((0.0, 0.0, 0.3), (0.0, 0.0, 0.4)) is None, "a fingertip behind the eye aims nowhere")
 check(back_project(700, 360, 0.5, 1280, 720, 914)[0] < 0, "right of the image centre is the user's left (the camera faces them)")
 
@@ -473,7 +473,7 @@ for target in ((0.0, 0.05), (-0.12, 0.02), (0.14, 0.19)):
     want = (target[0] * SW / 0.345 + SW / 2, target[1] * SH / 0.223)
     check(m.hit is not None and close(m.hit, target, 1e-3), f"the ray hits the aimed spot {target} ({m.hit})")
     check(got is not None and close(got, want, 1.0), f"the hit becomes the right screen point ({got} vs {want})")
-check(aim_at(AimMap(SW, SH, MM, through="tip"), eye, (0.0, 0.1), 0.52) is None, "no aim while the fingertip is at the eye")
+check(aim_at(AimMap(SW, SH, MM, through="tip"), eye, (0.0, 0.1), 0.45) is None, "no aim while the fingertip is near the eye")
 m = AimMap(SW, SH, MM, through="tip")
 check(m(scene(eye, (0, 0.1), 0.3)[1], HAND, CW, CH) is None, "no aim before the face has been seen")
 m = AimMap(SW, SH, MM, through="tip")

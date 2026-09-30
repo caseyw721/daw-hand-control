@@ -856,9 +856,10 @@ def back_project(u, v, z, cam_w, cam_h, f_px):
     return (-(u - cam_w / 2) * z / f_px, (v - cam_h / 2) * z / f_px, z)
 
 
-def aim_hit(eye, tip, min_gap=0.05):
+def aim_hit(eye, tip, min_gap=0.15):
     """Where the line from the eye through the fingertip meets the screen (X, Y metres), or None unless the fingertip
-    is at least `min_gap` in front of the eye."""
+    is at least `min_gap` in front of the eye. A short eye-to-fingertip line magnifies every wobble: with the hand near
+    the face (10 % of frames live, gap under 13 cm) the aim flew to -3402, 4389 px; then the cursor holds still."""
     gap = eye[2] - tip[2]
     if gap < min_gap or tip[2] <= 0:
         return None
