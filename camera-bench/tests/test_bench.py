@@ -156,7 +156,14 @@ check(point_of(lm, "web") == (0.44, 0.625), "web = between thumb base and index 
 curled = list(lm)
 curled[8] = (0.45, 0.55, 0.0)      # the index curls toward the thumb
 check(point_of(curled, "thumb") == point_of(lm, "thumb"), "curling the index does not move the thumb anchor")
-check(set(POINTS) == {"tip", "thumb", "thumbip", "thumbtip", "web", "palm"}, "all anchor names are known")
+check(set(POINTS) == {"tip", "base", "thumb", "thumbip", "thumbtip", "web", "palm"}, "all anchor names are known")
+lm2 = [(0.1 * i / 21, 0.5, 0.0) for i in range(21)]
+bx, by = point_of(lm2, "base")
+check(abs(bx - sum(lm2[k][0] for k in (0, 5, 9, 13, 17)) / 5) < 1e-12 and by == 0.5, "base = wrist + four finger knuckles")
+bent = list(lm2)
+for k in (6, 7, 8, 10, 11, 12, 3, 4):   # fingers and thumb curl: joints past the knuckles move
+    bent[k] = (bent[k][0] + 0.05, bent[k][1] + 0.05, 0.0)
+check(point_of(bent, "base") == point_of(lm2, "base"), "bending the fingers or the thumb does not move the base anchor")
 
 # --- despike: a single-frame glitch never reaches the cursor; n=1 passes everything ---
 from bench import Despike, Rate  # noqa: E402
@@ -197,8 +204,12 @@ for i in range(10):
     k.update((700, 700), i / 30, 10.0, target=None)
 check(k.at == (700, 700), "`anywhere` restores the rest-anywhere lock")
 k = Lock(dwell=0.2, still=120, breakout=50)
-out = k.update((300, 300), 0.0, 400.0, held=True, grab_at=(290, 305))
-check(out == (290, 305), "a grab locks where the pointer was just before the pinch")
+out = k.update((300, 300), 0.0, 400.0, held=True, grab_at=(290, 305), target=None)
+check(out == (300, 300) and k.at is None, "a pinch over nothing does not lock (user, live: it locked wherever the pinch was)")
+k = Lock(dwell=0.2, still=120, breakout=50)
+knob = (270, 285, 40, 40)
+out = k.update((300, 300), 0.0, 400.0, held=True, grab_at=(290, 305), target=knob)
+check(out == (290, 305), "a pinch over a control locks where the pointer was just before the pinch")
 out = k.update((500, 500), 0.1, 900.0, held=True)
 check(out == (290, 305), "while the grab is held nothing breaks the lock")
 out = k.update((500, 500), 0.2, 900.0, held=False)

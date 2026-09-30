@@ -204,7 +204,7 @@ def pinch_dist(wlm):
 
 
 THUMB_MCP, THUMB_IP = 2, 3
-POINTS = ("tip", "thumb", "thumbip", "thumbtip", "web", "palm")
+POINTS = ("tip", "base", "thumb", "thumbip", "thumbtip", "web", "palm")
 PREPS = ("none", "enhance", "gray")
 
 
@@ -220,6 +220,12 @@ def point_of(lm, which):
     palm      mean of the four finger knuckles"""
     if which == "tip":
         return lm[INDEX_TIP][0], lm[INDEX_TIP][1]
+    if which == "base":
+        # wrist + the four finger knuckles: they move only when the whole hand moves, never when fingers bend.
+        # User, live: "the thumb ... does move probably forty percent where the index finger moves sixty";
+        # measured on real pinches: the thumb anchor moved 440 px, this one 249, with the same noise
+        ks = (WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP)
+        return sum(lm[k][0] for k in ks) / 5, sum(lm[k][1] for k in ks) / 5
     if which == "thumb":
         ks = (THUMB_MCP, THUMB_IP, INDEX_MCP)
         return sum(lm[k][0] for k in ks) / 3, sum(lm[k][1] for k in ks) / 3
@@ -271,7 +277,10 @@ class Lock:
             self.still_since = None
             return pos
         if held:
+            if target is None and not self.anywhere:
+                return pos        # a pinch over nothing does not lock (user, live: "it still locks wherever the pinch is")
             self.at = grab_at or pos
+            self.frame = target
             return self.at
         if self.dwell > 0 and speed < self.still and (target is not None or self.anywhere):
             if self.still_since is None:
@@ -330,6 +339,35 @@ class AXProbe:
             return None
         return (pt.x, pt.y, sz.width, sz.height)
 
+    def classify(self, el):
+        """(role, frame, name) of the control at this element, or (role, frame, name, False) style None-role if it
+        is not one. Logic reports its pan knobs under a same-size 'knob readout' text, its plug-in slots as groups
+        named 'audio plug-in', and much else as elements with press/increment actions (surveyed live)."""
+        role = str(self._attr(el, "AXRole") or "")
+        frame = self._frame(el)
+        name = str(self._attr(el, "AXTitle") or self._attr(el, "AXDescription") or "")
+        low = name.lower()
+        if frame is None:
+            return role, None, name, False
+        small = frame[2] <= 120 and frame[3] <= 200
+        if role in CONTROL_ROLES:
+            return role, frame, name, True
+        if role == "AXStaticText" and ("knob" in low or "readout" in low) and small:
+            return "AXSlider", frame, name, True             # the pan knob under its readout: grab it like a knob
+        if role == "AXGroup" and "plug" in low and small:
+            return "AXButton", frame, name, True              # a plug-in slot
+        err, acts = self.AS.AXUIElementCopyActionNames(el, None)
+        acts = set(acts or []) if err == 0 else set()
+        if small and acts & {"AXPress", "AXIncrement", "AXDecrement", "AXPick"}:
+            return ("AXSlider" if "AXIncrement" in acts else "AXButton"), frame, name, True
+        parent = self._attr(el, "AXParent")
+        if parent is not None:
+            prole = str(self._attr(parent, "AXRole") or "")
+            pframe = self._frame(parent)
+            if prole in CONTROL_ROLES and pframe and pframe[2] <= 120 and pframe[3] <= 200:
+                return prole, pframe, str(self._attr(parent, "AXTitle") or self._attr(parent, "AXDescription") or name), True
+        return role, frame, name, False
+
     def _run(self):
         last = None
         while True:
@@ -342,18 +380,16 @@ class AXProbe:
             try:
                 err, el = self.AS.AXUIElementCopyElementAtPosition(self.sys, pos[0], pos[1], None)
                 if err != 0 or el is None:
-                    self.found = (time.monotonic(), None, None, "")
+                    self.found = (time.monotonic(), None, None, "", False)
                     continue
-                role = self._attr(el, "AXRole") or ""
-                frame = self._frame(el)
-                title = self._attr(el, "AXTitle") or self._attr(el, "AXDescription") or ""
-                self.found = (time.monotonic(), str(role), frame, str(title))
+                role, frame, name, is_control = self.classify(el)
+                self.found = (time.monotonic(), role, frame, name, is_control)
             except Exception:
-                self.found = (time.monotonic(), None, None, "")
+                self.found = (time.monotonic(), None, None, "", False)
 
     def control_at(self, pos):
         f = self.found
-        if not f or f[1] not in CONTROL_ROLES or f[2] is None or time.monotonic() - f[0] > 0.4:
+        if not f or not f[4] or f[2] is None or time.monotonic() - f[0] > 0.4:
             return None
         x, y, w, h = f[2]
         if w * h > 300 * 300 or not (x - 2 <= pos[0] <= x + w + 2 and y - 2 <= pos[1] <= y + h + 2):
@@ -1182,8 +1218,9 @@ def main():
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fcol, 1)
                 on = f" on {probe.label()}" if (probe and lock.frame is not None) else ""
                 label = "CALIBRATING: sweep your range" if calibrating else (
-                    f"GRAB: turning {grab.dy:+.0f} px" if grab.active else (
-                        "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else "")))
+                    "HANDS OFF: say \"hands on\"" if not cursor.enabled else (
+                        f"GRAB: turning {grab.dy:+.0f} px" if grab.active else (
+                            "PINCH (locked)" if pinch.closed else (f"LOCKED{on}" if lock.at is not None else ""))))
                 if label:
                     cv2.putText(disp, label, (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 200, 255), 2)
                 cv2.imshow("camera bench (q quits)", disp)
