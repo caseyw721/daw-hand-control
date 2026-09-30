@@ -482,6 +482,8 @@ def main():
                     help="low light: neutralise a colour cast (grey world) and lift contrast (CLAHE) before detection; "
                          "the preview shows the corrected image")
     ap.add_argument("--detection", type=float, default=0.5, help="MediaPipe min hand detection confidence (lower finds a hand sooner in poor light)")
+    ap.add_argument("--control", action="store_true",
+                    help="read live tuning lines on stdin: 'filter <mincutoff> <beta>', 'lead <ms>', 'cursor on|off'")
     ap.add_argument("--model", default=MODEL)
     args = ap.parse_args()
 
@@ -496,6 +498,30 @@ def main():
     sw, sh = cursor.screen()
     mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
+    if args.control:
+        # live tuning from the parent (the gesture engine forwards its file's `pointer` line):
+        #   filter <mincutoff> <beta> | lead <ms> | cursor on|off
+        import threading
+
+        def control_loop():
+            for raw in sys.stdin:
+                parts = raw.split()
+                try:
+                    if parts[:1] == ["filter"] and len(parts) == 3:
+                        for f in (fx, fy):
+                            f.mincutoff, f.beta = float(parts[1]), float(parts[2])
+                    elif parts[:1] == ["lead"] and len(parts) == 2:
+                        args.lead_ms = float(parts[1])
+                    elif parts[:1] == ["cursor"] and len(parts) == 2:
+                        if parts[1] == "on" and cursor.Q is None:
+                            cursor.Q = __import__("Quartz")
+                        cursor.enabled = parts[1] == "on"
+                    else:
+                        raise ValueError(raw.strip())
+                    print(f"I,control,{raw.strip()}", file=sys.stderr, flush=True)
+                except (ValueError, IndexError) as e:
+                    print(f"I,control,ignored,{e}", file=sys.stderr, flush=True)
+        threading.Thread(target=control_loop, name="control", daemon=True).start()
     pinch = Pinch(on=args.pinch_on, off=args.pinch_off, min_frames=2, off_frames=3)
     presence = Presence(hold_s=args.hold_ms / 1000)
     history = collections.deque(maxlen=64)  # (t, x, y) for the Heisenberg offset
