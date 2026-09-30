@@ -2123,7 +2123,12 @@ def main():
                     if held_down and isinstance(mapper, AimMap):
                         # the pinch moved the fingertip and the aim with it: grab where the cursor was before it began
                         rw = rewind_point(history, hand_hist, t_det, what="thumb" if thumb_mode else (
-                            "grip" if (not pinch.closed and args.grip == "on" and grip.closed) else "pinch"))
+                            "grip" if (not pinch.closed and args.grip == "on" and grip.closed) else "pinch"),
+                            span=0.3 if thumb_mode else REWIND_S)
+                        if rw is not None and thumb_mode and math.hypot(pos[0] - rw[0], pos[1] - rw[1]) > 250:
+                            # the finger gun barely moves the aim: a long way back is where the user aimed before (live:
+                            # a 1582 px jump), not where the thumb began to drop
+                            rw = None
                         if rw is not None:
                             print(f"I,rewind,{math.hypot(pos[0] - rw[0], pos[1] - rw[1]):.0f}px", file=sys.stderr, flush=True)
                             click_at = pos = rw
