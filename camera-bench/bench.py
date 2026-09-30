@@ -309,6 +309,63 @@ def rect_from_sweep(pts, shrink=0.05, lo_p=0.03, hi_p=0.97):
     return (x0, y0, x1, y1)
 
 
+def px_per_metre(img, world, w, h):
+    """How many image pixels one metre of hand spans right now (weak perspective), fitted over all 21
+    landmarks: centred image points ≈ s × centred world points (x, y). The world landmarks are the hand's
+    shape in metres in the camera's orientation, so a turned hand is foreshortened in both and the fit
+    stays right; s = f / distance, so it measures how far the hand is from the camera."""
+    n = len(img)
+    ix = [p[0] * w for p in img]
+    iy = [p[1] * h for p in img]
+    wx = [p[0] for p in world]
+    wy = [p[1] for p in world]
+    mix, miy, mwx, mwy = sum(ix) / n, sum(iy) / n, sum(wx) / n, sum(wy) / n
+    num = sum((ix[k] - mix) * (wx[k] - mwx) + (iy[k] - miy) * (wy[k] - mwy) for k in range(n))
+    den = sum((wx[k] - mwx) ** 2 + (wy[k] - mwy) ** 2 for k in range(n))
+    return num / den if den > 1e-12 else None
+
+
+class MetricMap:
+    """3-D hand position to a steady 2-D cursor (the parallax fix). The anchor's image position is
+    turned into where the hand really is, sideways and up/down, in metres, using its distance from the
+    camera (px_per_metre): X = (x_px - centre) / s. Moving toward or away from the camera no longer
+    slides the cursor, and 1 cm of movement is the same number of pixels near or far. A pad of
+    pad_w × pad_h metres around `centre` spans the screen; the centre is where the hand first appears
+    (or `recenter`). The distance estimate is smoothed hard: a hand's depth changes slowly."""
+
+    def __init__(self, screen_w, screen_h, pad=(0.24, 0.15)):
+        self.w, self.h = screen_w, screen_h
+        self.pad = pad
+        self.centre = None
+        self.s = None
+        self.recenter_next = False
+        self.last = None             # (X, Y) metres, for recenter and logs
+
+    def scale(self, s):
+        """Smooths px-per-metre: fast enough to follow a reach, slow enough not to shake the cursor."""
+        if s is None or s <= 0:
+            return self.s
+        self.s = s if self.s is None else self.s + 0.12 * (s - self.s)
+        return self.s
+
+    def __call__(self, nx, ny, img, world, cam_w, cam_h):
+        s = self.scale(px_per_metre(img, world, cam_w, cam_h) if (img and world) else None)
+        if not s:
+            return None
+        X = -(nx * cam_w - cam_w / 2) / s        # mirrored: the user's right is +X
+        Y = (ny * cam_h - cam_h / 2) / s
+        self.last = (X, Y)
+        if self.centre is None or self.recenter_next:
+            self.centre, self.recenter_next = (X, Y), False
+        u = min(max((X - self.centre[0]) / self.pad[0] + 0.5, 0.0), 1.0)
+        v = min(max((Y - self.centre[1]) / self.pad[1] + 0.5, 0.0), 1.0)
+        return u * (self.w - 1), v * (self.h - 1)
+
+    def distance(self, f_px):
+        """Estimated camera-to-hand distance in metres for a focal length in px (for the preview)."""
+        return f_px / self.s if self.s else None
+
+
 class RelativeMap:
     """Air-mouse style: hand motion moves the cursor by gain × normalised motion."""
 
@@ -533,7 +590,11 @@ def parse_rect(s):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--mode", choices=["abs", "rel"], default="abs")
+    ap.add_argument("--mode", choices=["abs", "rel", "metric"], default="abs",
+                    help="abs: a box of the camera image spans the screen; rel: air mouse; metric: the hand's real "
+                         "position in cm, corrected for its distance from the camera (no parallax), --pad spans the screen")
+    ap.add_argument("--pad", type=parse_pair, default=(24.0, 15.0), metavar="W,H",
+                    help="metric: centimetres of hand movement that span the screen, across and down")
     ap.add_argument("--point", choices=list(POINTS), default="tip",
                     help="what drives the cursor: tip (index fingertip), thumb (thumb middle joint: the index can grab "
                          "without moving it), thumbtip, web (thumb base/index knuckle), palm")
@@ -609,7 +670,14 @@ def main():
     sound = Sound(enabled=not args.quiet)
     marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
     sw, sh = cursor.screen()
-    mapper = AbsoluteMap(sw, sh, args.box, args.rect) if args.mode == "abs" else RelativeMap(sw, sh, args.gain)
+    def make_mapper(mode):
+        if mode == "metric":
+            return MetricMap(sw, sh, (args.pad[0] / 100, args.pad[1] / 100))
+        if mode == "abs":
+            return AbsoluteMap(sw, sh, args.box, args.rect)
+        return RelativeMap(sw, sh, args.gain)
+    mapper = make_mapper(args.mode)
+    nonlocal_state = {}           # requests from the control thread, applied between frames by the main loop
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
     lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout)
     despike = Despike(args.median)
@@ -641,6 +709,13 @@ def main():
                         args.prep = parts[1]
                     elif parts[:1] == ["median"] and len(parts) == 2:
                         despike.n = max(1, int(parts[1]))
+                    elif parts[:1] == ["map"] and len(parts) == 2 and parts[1] in ("abs", "metric", "rel"):
+                        nonlocal_state["mapper"] = parts[1]
+                    elif parts[:1] == ["pad"] and len(parts) == 3:
+                        args.pad = (float(parts[1]), float(parts[2]))
+                        nonlocal_state["pad"] = True
+                    elif parts[:1] == ["recenter"]:
+                        nonlocal_state["recenter"] = True
                     elif parts[:1] == ["lock"] and len(parts) in (3, 4):
                         lock.dwell, lock.breakout = float(parts[1]) / 1000, float(parts[2])
                         if len(parts) == 4:
@@ -702,11 +777,25 @@ def main():
     det_ms, loop_ms, frames, hands = [], [], 0, 0
     sec_raw, sec_pos = [], []  # this second's tracked points (raw and shown) for the stillness report
     last_pos = None
+    last_raw = None
     held_gaps = lost_n = 0
     prev_state = "gone"
     try:
         while True:
             t_loop = time.perf_counter()
+            if nonlocal_state:
+                want = nonlocal_state.pop("mapper", None)
+                if want and want != args.mode:
+                    args.mode = want
+                    mapper = make_mapper(want)
+                    fx.reset(); fy.reset(); despike.reset(); lock.reset()
+                    last_raw = None
+                if nonlocal_state.pop("pad", None) and isinstance(mapper, MetricMap):
+                    mapper.pad = (args.pad[0] / 100, args.pad[1] / 100)
+                if nonlocal_state.pop("recenter", None) and isinstance(mapper, MetricMap):
+                    mapper.recenter_next = True
+                    lock.reset()
+                    sound.play("Glass")
             ok, frame = cap.read()
             t_frame = time.perf_counter()
             if not ok:
@@ -768,7 +857,12 @@ def main():
                         sound.play("Glass")
                         calibrating = False
                 else:
-                    raw = mapper(nx, ny)
+                    if isinstance(mapper, MetricMap):
+                        wlm = [(p.x, p.y, p.z) for p in res.hand_world_landmarks[0]] if res.hand_world_landmarks else None
+                        raw = mapper(nx, ny, lm, wlm, cw, ch) or last_raw or (sw / 2, sh / 2)
+                    else:
+                        raw = mapper(nx, ny)
+                    last_raw = raw
                     q = despike(raw)
                     pos = (fx(q[0], t_det), fy(q[1], t_det))
                     if args.lead_ms:
@@ -837,7 +931,11 @@ def main():
                 cv2.putText(disp, found, (16, fh - 20), cv2.FONT_HERSHEY_SIMPLEX, 1.1, colour, 3)
                 # live frame rate (user request): green at 28+, amber at 20+, red below
                 fcol = (0, 220, 0) if fps_now >= 28 else ((0, 200, 255) if fps_now >= 20 else (0, 0, 255))
-                stats = f"{fps_now:4.1f} fps   detect {(t_det - t_frame) * 1000:4.1f} ms   {args.point} / {args.prep}"
+                stats = f"{fps_now:4.1f} fps   detect {(t_det - t_frame) * 1000:4.1f} ms   {args.point} / {args.prep} / {args.mode}"
+                if isinstance(mapper, MetricMap) and mapper.s:
+                    # the MacBook camera's field of view is ~70 degrees across: f = (w/2) / tan(35 deg)
+                    d = mapper.distance((cw / 2) / math.tan(math.radians(35)))
+                    stats += f"   hand ~{d * 100:.0f} cm away"
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 4)
                 cv2.putText(disp, stats, (16, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.6, fcol, 1)
                 label = "CALIBRATING: sweep your range" if calibrating else (

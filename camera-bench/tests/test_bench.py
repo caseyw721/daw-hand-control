@@ -195,5 +195,54 @@ for i in range(20):
     out = k.update((100, 100), i / 30, 10.0)
 check(k.at is None, "dwell 0 turns hover locking off")
 
+# --- metric mapping: 3-D hand position to a steady 2-D cursor (the parallax fix) ---
+from bench import MetricMap, px_per_metre  # noqa: E402
+
+
+def project(world_hand, centre_m, f=900.0, w=1280, h=720):
+    """A pinhole camera: a hand whose shape is `world_hand` (metres, hand-centred) with its centre at
+    `centre_m` = (X, Y, Z) metres from the camera -> normalised image landmarks."""
+    out = []
+    for x, y, z in world_hand:
+        X, Y, Z = centre_m[0] + x, centre_m[1] + y, centre_m[2] + z
+        out.append((0.5 + f * X / Z / w, 0.5 + f * Y / Z / h, 0.0))
+    return out
+
+
+hand = [(0.01 * (i % 5) - 0.02, -0.02 * (i // 5) + 0.04, 0.003 * (i % 3)) for i in range(21)]  # a 21-point hand shape
+img = project(hand, (0.0, 0.0, 0.5))
+s = px_per_metre(img, hand, 1280, 720)
+check(abs(s - 900 / 0.5) / (900 / 0.5) < 0.02, f"px per metre = f / distance ({s:.0f} vs 1800)")
+check(abs(px_per_metre(project(hand, (0.0, 0.0, 1.0)), hand, 1280, 720) - 900) < 20, "twice as far, half the pixels per metre")
+
+
+def cursor_at(m, centre_m, anchor=0, frames=40):
+    """Feed the same hand pose a few frames (the depth estimate is smoothed) and return the cursor."""
+    out = None
+    for _ in range(frames):
+        lmk = project(hand, centre_m)
+        out = m(lmk[anchor][0], lmk[anchor][1], lmk, hand, 1280, 720)
+    return out
+
+
+m = MetricMap(1728, 1117, pad=(0.24, 0.15))
+start = cursor_at(m, (0.05, 0.02, 0.50))
+check(abs(start[0] - 1727 / 2) < 1 and abs(start[1] - 1116 / 2) < 1, f"the first position is the screen centre ({start})")
+toward = cursor_at(m, (0.05, 0.02, 0.35))
+check(abs(toward[0] - start[0]) < 12 and abs(toward[1] - start[1]) < 12,
+      f"moving 15 cm toward the camera, off-axis, barely moves the cursor ({start} -> {toward})")
+m2 = MetricMap(1728, 1117, pad=(0.24, 0.15))
+cursor_at(m2, (0.0, 0.0, 0.40))
+near = cursor_at(m2, (-0.02, 0.0, 0.40))      # 2 cm to the camera's left = the user's right (mirrored)
+m3 = MetricMap(1728, 1117, pad=(0.24, 0.15))
+cursor_at(m3, (0.0, 0.0, 0.70))
+far = cursor_at(m3, (-0.02, 0.0, 0.70))
+check(abs((near[0] - 1727 / 2) - (far[0] - 1727 / 2)) < 8,
+      f"2 cm sideways moves the cursor the same near and far ({near[0] - 863.5:.0f} vs {far[0] - 863.5:.0f} px)")
+check(near[0] > 1727 / 2, "the user's right is the cursor's right")
+check(abs((near[0] - 1727 / 2) - 0.02 / 0.24 * 1727) < 8, f"2 cm of a 24 cm pad is 1/12 of the screen ({near[0] - 863.5:.0f} px)")
+a = MetricMap(1728, 1117)
+check(a(0.5, 0.5, None, None, 1280, 720) is None, "no world landmarks, no metric position")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)
