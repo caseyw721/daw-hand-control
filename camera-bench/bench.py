@@ -214,6 +214,49 @@ TAP_S = 0.4                  # the finger gun: a trigger press shorter than this
 REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
 
 
+TOOL_ALIASES = {"glue": "join", "slice": "scissors", "cut": "scissors", "arrow": "pointer"}
+
+
+def pick_logic_tool(name):
+    """Chooses Logic's left-click tool by name from its own tool menu (the "Left Click Tool" menu button), through
+    Accessibility: no key command to guess, and it works whatever the user's key assignments are. Returns the tool
+    chosen, or None. Opening the menu takes ~0.3 s; call it off the frame loop."""
+    import ApplicationServices as AS
+    from AppKit import NSWorkspace
+    name = TOOL_ALIASES.get(name.lower(), name.lower())
+    apps = [a for a in NSWorkspace.sharedWorkspace().runningApplications() if (a.localizedName() or "") == "Logic Pro"]
+    if not apps:
+        return None
+    app = AS.AXUIElementCreateApplication(apps[0].processIdentifier())
+
+    def attr(el, n):
+        err, v = AS.AXUIElementCopyAttributeValue(el, n, None)
+        return v if err == 0 else None
+
+    button, stack = None, [(w, 0) for w in (attr(app, "AXWindows") or [])]
+    while stack and button is None:
+        el, depth = stack.pop()
+        if str(attr(el, "AXRole")) == "AXMenuButton" and "Left Click Tool" in str(
+                attr(el, "AXDescription") or attr(el, "AXTitle") or ""):
+            button = el
+        elif depth < 12:
+            stack.extend((c, depth + 1) for c in (attr(el, "AXChildren") or []))
+    if button is None:
+        return None
+    AS.AXUIElementPerformAction(button, "AXPress")
+    time.sleep(0.3)
+    chosen = None
+    for menu in attr(button, "AXChildren") or []:
+        for item in attr(menu, "AXChildren") or []:
+            title = str(attr(item, "AXTitle") or "")
+            if chosen is None and title.lower().startswith(name):
+                AS.AXUIElementPerformAction(item, "AXPress")
+                chosen = title
+        if chosen is None:
+            AS.AXUIElementPerformAction(menu, "AXCancel")
+    return chosen
+
+
 def rewind_point(history, hand_hist, t, what="pinch", span=REWIND_S, noise=None):
     """Where the cursor was just before a pinch (or, with `grip`, a closing hand) began, for the grab and the click.
     In aim mode the ray runs through the fingertip, and closing the fingers moves it: over the 0.4 s before a pinch
@@ -580,6 +623,11 @@ class AXProbe:
         small = frame[2] <= 120 and frame[3] <= 200
         if role in CONTROL_ROLES:
             return role, frame, name, True
+        if role == "AXHandle" and "locator" in low and small:
+            return "AXHandle", frame, name, True             # a cycle locator: drag to move the cycle's start or end
+        if role == "AXLayoutItem" and "cycle" in low:
+            return "AXLayoutItem", frame, name, True         # the cycle area (user, live: "cycle range slider I use all
+                                                             # the time"): drag it to move the range, tap to toggle cycle
         if role == "AXTextField" and frame[3] <= TEXT_BAR_MAX_H:
             # a text bar (search box, address bar, name field) is a target too (user, live: "I don't have a way to click
             # on the little bar where you type things in"); a tall text area is not, or a lock would hold the cursor
@@ -1307,7 +1355,8 @@ class Cursor:
                 "w": 13, "e": 14, "r": 15, "y": 16, "t": 17, "1": 18, "2": 19, "3": 20, "4": 21, "6": 22, "5": 23,
                 "9": 25, "7": 26, "8": 28, "0": 29, "o": 31, "u": 32, "i": 34, "p": 35, "l": 37, "j": 38, "k": 40,
                 "n": 45, "m": 46, "return": 36, "enter": 36, "tab": 48, "space": 49, "delete": 51, "escape": 53,
-                "left": 123, "right": 124, "down": 125, "up": 126, "home": 115, "end": 119}
+                "left": 123, "right": 124, "down": 125, "up": 126, "home": 115, "end": 119,
+                "comma": 43, "period": 47}
 
     def key(self, combo):
         """Press a key combination in the app in front, e.g. 'x', 'cmd+z', 'cmd+shift+s', 'return'. Returns False if a
@@ -1351,7 +1400,8 @@ class Cursor:
         self.Q.CGAssociateMouseAndMouseCursorPosition(True)
 
 
-DRAG_ROLES = {"AXSlider", "AXIncrementor", "AXValueIndicator", "AXLevelIndicator"}
+DRAG_ROLES = {"AXSlider", "AXIncrementor", "AXValueIndicator", "AXLevelIndicator",
+              "AXHandle", "AXLayoutItem"}   # the last two only as classify admits them: Logic's cycle area and locators
 
 
 class Grab:
@@ -1860,6 +1910,13 @@ def main():
                     elif parts[:1] == ["precision"] and len(parts) == 2:
                         precision.gain = min(max(float(parts[1]), 0.05), 1.0)
                         precision.reset()
+                    elif parts[:1] == ["tool"] and len(parts) == 2:
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        chosen = pick_logic_tool(parts[1])
+                        if chosen is None:
+                            raise ValueError(f"no Logic tool {parts[1]!r} (is Logic open with a Tracks window?)")
+                        print(f"I,tool,{chosen}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["key"] and len(parts) == 2:
                         if not cursor.key(parts[1]):
                             raise ValueError(f"unknown key or hands off: {parts[1]}")
