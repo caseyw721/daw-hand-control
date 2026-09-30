@@ -308,6 +308,7 @@ CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AX
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
+READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
 
 
 class Lock:
@@ -1264,10 +1265,15 @@ def main():
     calibrating = args.mode == "abs" and args.calibrate > 0
     cal_pts, cal_until = [], None
 
-    cap = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
-    cap.set(cv2.CAP_PROP_FPS, args.fps)  # (CAP_PROP_BUFFERSIZE is not supported by the AVFoundation backend)
+    def open_camera():
+        c = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
+        c.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        c.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
+        c.set(cv2.CAP_PROP_FPS, args.fps)  # (CAP_PROP_BUFFERSIZE is not supported by the AVFoundation backend)
+        return c
+
+    cap = open_camera()
+    read_fails = 0                # consecutive failed reads; the camera is reopened after READ_FAILS_REOPEN
     if not cap.isOpened():
         sys.exit("camera %d did not open (Camera permission for this terminal?)" % args.camera)
     cw, ch, cfps = cap.get(3), cap.get(4), cap.get(5)
@@ -1336,9 +1342,21 @@ def main():
             t_frame = time.perf_counter()
             slow = [("camera", t_frame - t_mark)]
             if not ok:
-                print("I,camera read failed", file=sys.stderr, flush=True)
+                read_fails += 1
+                if read_fails == 1 or read_fails % 100 == 0:
+                    print(f"I,camera read failed,{read_fails}", file=sys.stderr, flush=True)
+                if read_fails % READ_FAILS_REOPEN == 0:
+                    # the camera stopped delivering mid-session (found live: 341 failed reads until a restart); reopen it
+                    print("I,camera,reopening", file=sys.stderr, flush=True)
+                    cap.release()
+                    time.sleep(0.5)
+                    cap = open_camera()
+                    pinned = False
                 time.sleep(0.01)
                 continue
+            if read_fails:
+                print(f"I,camera,frames again after {read_fails} failed reads", file=sys.stderr, flush=True)
+                read_fails = 0
             if not pinned:
                 cap.set(cv2.CAP_PROP_FPS, args.fps)
                 pinned = True
