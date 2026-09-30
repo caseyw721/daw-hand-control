@@ -107,6 +107,47 @@ def gray_prep(bgr, clahe):
     return cv2.cvtColor(clahe.apply(g), cv2.COLOR_GRAY2BGR)
 
 
+class Precision:
+    """Slow hand movement moves the cursor less: below `v_lo` px/s the cursor moves `gain` of the hand's
+    movement, from `v_hi` up all of it, a ramp between (the PRISM idea, Frees et al. 2007; a mouse's
+    acceleration curve does the same). Hand tremor and drift are slow, so they shrink with it, and aiming
+    is a fast move followed by slow corrections, so the corrections get finer. The offset this builds
+    between hand and cursor is paid back only in the hand's direction of travel: `pull` of it per frame
+    on fast moves, `bleed` on moderate ones, none while the hand is still. A gap in the frames starts
+    over at the hand's spot. Replayed on the 2026-09-29 sessions at gain 0.35: still jitter p50 9.3 to
+    4.0 px, p90 22 to 16 px; the cursor sits 22 px (p50) and 60 px (p90) from the hand's own spot.
+    gain 1 is off."""
+
+    def __init__(self, gain=1.0, v_lo=150.0, v_hi=600.0, pull=0.3, bleed=0.05):
+        self.gain, self.v_lo, self.v_hi, self.pull, self.bleed = gain, v_lo, v_hi, pull, bleed
+        self.reset()
+
+    def reset(self):
+        self.at = self.last = self.t = None
+
+    def __call__(self, p, t):
+        if self.gain >= 1.0:
+            self.reset()
+            return p
+        if self.at is None or t - self.t > 0.3:
+            self.at, self.last, self.t = p, p, t
+            return p
+        dx, dy = p[0] - self.last[0], p[1] - self.last[1]
+        v = math.hypot(dx, dy) / max(t - self.t, 1e-3)
+        k = self.gain + (1.0 - self.gain) * min(max((v - self.v_lo) / (self.v_hi - self.v_lo), 0.0), 1.0)
+        x, y = self.at[0] + k * dx, self.at[1] + k * dy
+        ox, oy = p[0] - x, p[1] - y
+        pull = self.pull if v > self.v_hi else (self.bleed if v > self.v_lo else 0.0)
+        if pull and ox * dx + oy * dy > 0:
+            x, y = x + pull * ox, y + pull * oy
+        self.at, self.last, self.t = (x, y), p, t
+        return self.at
+
+    def offset(self):
+        """How far the cursor sits from the hand's own spot, px (for the preview and diagnostic page)."""
+        return 0.0 if self.at is None else math.hypot(self.last[0] - self.at[0], self.last[1] - self.at[1])
+
+
 class Despike:
     """Median of the last n points: a single-frame landmark glitch never reaches the cursor. Costs
     (n-1)/2 frames of delay; n=1 is off."""
@@ -460,13 +501,22 @@ class MetricMap:
     turned into where the hand really is, sideways and up/down, in metres, using its distance from the
     camera (px_per_metre): X = (x_px - centre) / s. Moving toward or away from the camera no longer
     slides the cursor, and 1 cm of movement is the same number of pixels near or far. A pad of
-    pad_w × pad_h metres around `centre` spans the screen; the centre is where the hand first appears
-    (or `recenter`). The distance estimate is smoothed hard: a hand's depth changes slowly."""
+    pad_w × pad_h metres around `centre` spans the screen. Across, the centre is the camera's line.
+    Down, the pad sits as low as it can while the whole hand stays in the camera's view at the pad's
+    bottom edge: the hand's lowest point (learned live, about 6 cm below the base anchor) may reach
+    `keep` of the frame height, no further. `recenter` moves the centre to the hand, but never so low
+    that the bottom edge leaves the view. (The first-seen position put half the pad below the frame,
+    because hands come into view from the bottom: 18 of 22 pinches lost the hand, found live.)
+    The distance estimate is smoothed hard: a hand's depth changes slowly."""
 
-    def __init__(self, screen_w, screen_h, pad=(0.24, 0.15)):
+    def __init__(self, screen_w, screen_h, pad=(0.24, 0.15), keep=0.95):
         self.w, self.h = screen_w, screen_h
         self.pad = pad
-        self.centre = None
+        self.keep = keep
+        self.centre = None           # the centre in use, (X, Y) metres
+        self.wanted = None           # where "recenter" put it (the vertical part is still kept in view)
+        self.below = 0.06            # metres from the anchor down to the hand's lowest point, learned live
+        self.bottom = None           # the lowest the pad's bottom edge may sit, metres below the camera line
         self.s = None
         self.recenter_next = False
         self.last = None             # (X, Y) metres, for recenter and logs
@@ -485,13 +535,21 @@ class MetricMap:
         X = -(nx * cam_w - cam_w / 2) / s        # mirrored: the user's right is +X
         Y = (ny * cam_h - cam_h / 2) / s
         self.last = (X, Y)
+        if img:
+            reach = max(p[1] for p in img) - ny  # how far the hand hangs below the anchor, in frame heights
+            self.below += 0.05 * (max(0.0, reach * cam_h / s) - self.below)
+        bottom = (self.keep * cam_h - cam_h / 2) / s - self.below
+        self.bottom = bottom if self.bottom is None else self.bottom + 0.05 * (bottom - self.bottom)
+        lowest = self.bottom - self.pad[1] / 2   # the lowest centre that keeps the bottom edge in view
         if self.recenter_next:
-            self.centre, self.recenter_next = (X, Y), False
-        elif self.centre is None:
-            # across: the camera's line (it sits at the top-middle of the screen, so a hand straight in front of
-            # it is the screen's middle); down: where the hand first appears. The first-seen position for both
-            # put the centre 19 cm off when the hand came in from the side (found live); "recenter" still sets both.
-            self.centre = (0.0, Y)
+            self.wanted, self.recenter_next = (X, Y), False
+        # across: the camera's line (it sits at the top-middle of the screen, so a hand straight in front of
+        # it is the screen's middle); the first-seen position put the centre 19 cm off when the hand came in
+        # from the side (found live). Down: as low as the view allows, or where "recenter" put it if higher.
+        if self.wanted is None:
+            self.centre = (0.0, lowest)
+        else:
+            self.centre = (self.wanted[0], min(self.wanted[1], lowest))
         u = min(max((X - self.centre[0]) / self.pad[0] + 0.5, 0.0), 1.0)
         v = min(max((Y - self.centre[1]) / self.pad[1] + 0.5, 0.0), 1.0)
         return u * (self.w - 1), v * (self.h - 1)
@@ -793,6 +851,9 @@ def main():
                          "position in cm, corrected for its distance from the camera (no parallax), --pad spans the screen")
     ap.add_argument("--pad", type=parse_pair, default=(24.0, 15.0), metavar="W,H",
                     help="metric: centimetres of hand movement that span the screen, across and down")
+    ap.add_argument("--keep", type=float, default=0.95,
+                    help="metric: how far down the camera frame (0..1) the hand's lowest point may reach at the pad's "
+                         "bottom edge; the pad sits as low as this allows, so the whole screen is reachable in view")
     ap.add_argument("--point", choices=list(POINTS), default="tip",
                     help="what drives the cursor: tip (index fingertip), thumb (thumb middle joint: the index can grab "
                          "without moving it), thumbtip, web (thumb base/index knuckle), palm")
@@ -861,6 +922,9 @@ def main():
     ap.add_argument("--prep", choices=list(PREPS), default="none",
                     help="before detection: none; enhance (grey-world colour + CLAHE); gray (greyscale + CLAHE, "
                          "best in a dim coloured room). The preview shows the prepared image")
+    ap.add_argument("--precision", type=float, default=1.0,
+                    help="slow hand movement moves the cursor this fraction (0.35 = a third; 1 = off): steadier aiming, "
+                         "the cursor catches back up with the hand on quick moves")
     ap.add_argument("--median", type=int, default=1, help="despike: median of the last N anchor points (3 kills single-frame jumps; 1 = off)")
     ap.add_argument("--detection", type=float, default=0.5, help="MediaPipe min hand detection confidence (lower finds a hand sooner in poor light)")
     ap.add_argument("--control", action="store_true",
@@ -879,7 +943,7 @@ def main():
     sw, sh = cursor.screen()
     def make_mapper(mode):
         if mode == "metric":
-            return MetricMap(sw, sh, (args.pad[0] / 100, args.pad[1] / 100))
+            return MetricMap(sw, sh, (args.pad[0] / 100, args.pad[1] / 100), keep=args.keep)
         if mode == "abs":
             return AbsoluteMap(sw, sh, args.box, args.rect)
         return RelativeMap(sw, sh, args.gain)
@@ -900,6 +964,7 @@ def main():
         print("I,warning,no Accessibility bindings (pip install pyobjc-framework-ApplicationServices): hover lock off",
               file=sys.stderr, flush=True)
     despike = Despike(args.median)
+    precision = Precision(args.precision)
     rate = Rate()
     if args.enhance and args.prep == "none":
         args.prep = "enhance"
@@ -923,9 +988,12 @@ def main():
                         cursor.enabled = parts[1] == "on"
                     elif parts[:1] == ["point"] and len(parts) == 2 and parts[1] in POINTS:
                         args.point = parts[1]
-                        fx.reset(); fy.reset(); lock.reset(); despike.reset()      # a new anchor starts a new track
+                        fx.reset(); fy.reset(); lock.reset(); despike.reset(); precision.reset()  # a new anchor starts a new track
                     elif parts[:1] == ["prep"] and len(parts) == 2 and parts[1] in PREPS:
                         args.prep = parts[1]
+                    elif parts[:1] == ["precision"] and len(parts) == 2:
+                        precision.gain = min(max(float(parts[1]), 0.05), 1.0)
+                        precision.reset()
                     elif parts[:1] == ["median"] and len(parts) == 2:
                         despike.n = max(1, int(parts[1]))
                     elif parts[:1] == ["map"] and len(parts) == 2 and parts[1] in ("abs", "metric", "rel"):
@@ -933,6 +1001,10 @@ def main():
                     elif parts[:1] == ["pad"] and len(parts) == 3:
                         args.pad = (float(parts[1]), float(parts[2]))
                         nonlocal_state["pad"] = True
+                    elif parts[:1] == ["keep"] and len(parts) == 2:
+                        args.keep = min(max(float(parts[1]), 0.5), 1.0)
+                        if isinstance(mapper, MetricMap):
+                            mapper.keep = args.keep
                     elif parts[:1] == ["recenter"]:
                         nonlocal_state["recenter"] = True
                     elif parts[:1] == ["lock"] and len(parts) in (3, 4):
@@ -1014,7 +1086,7 @@ def main():
                 if want and want != args.mode:
                     args.mode = want
                     mapper = make_mapper(want)
-                    fx.reset(); fy.reset(); despike.reset(); lock.reset()
+                    fx.reset(); fy.reset(); despike.reset(); lock.reset(); precision.reset()
                     last_raw = None
                 if nonlocal_state.pop("pad", None) and isinstance(mapper, MetricMap):
                     mapper.pad = (args.pad[0] / 100, args.pad[1] / 100)
@@ -1058,7 +1130,7 @@ def main():
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_last.jpg"), last_hand_frame)
                     cv2.imwrite(os.path.join(args.dump, f"{stamp}_lost.jpg"), frame)
                     last_hand_frame, dumps = None, dumps + 1
-            raw = pos = q = free = None
+            raw = pos = q = free = smooth = None
             nx = ny = None
             ratio = dist = float("nan")
             event = None
@@ -1095,6 +1167,8 @@ def main():
                     if args.lead_ms:
                         ahead = lead_gain(math.hypot(fx.dx, fy.dx), *args.lead_gate) * args.lead_ms / 1000
                         pos = (fx.lead(ahead), fy.lead(ahead))
+                    smooth = pos
+                    pos = precision(pos, t_det)
                     history.append((t_det, pos[0], pos[1]))
                     if not math.isnan(dist):
                         event = pinch.update(dist)
@@ -1153,10 +1227,12 @@ def main():
                 fx.reset(); fy.reset()
                 lock.reset()
                 despike.reset()
+                precision.reset()
                 if grab.active:                                 # the hand vanished mid-grab: let go where it was
                     r = grab.end()
                     cursor.release(r[1], r[2])
                     cursor.warp(r[3], r[4])
+                    print(f"I,grab,release,{r[2] - r[4]:+.0f}px,hand lost", file=sys.stderr, flush=True)
                 grab.reset()
                 last_pos = None
                 if cursor.down:
@@ -1173,7 +1249,8 @@ def main():
                 pkt = {"t": round(t_det - t0, 3), "fps": round(fps_now, 1), "det": round((t_det - t_frame) * 1000, 1),
                        "state": state, "hand": bool(hand), "screen": [sw, sh], "mode": args.mode, "point": args.point,
                        "img": None if nx is None else [round(nx, 4), round(ny, 4)],
-                       "raw": r2(raw), "despiked": r2(q), "filtered": r2(free), "cursor": r2(pos),
+                       "raw": r2(raw), "despiked": r2(q), "filtered": r2(smooth), "precise": r2(free), "cursor": r2(pos),
+                       "precision": precision.gain,
                        "locked": lock.at is not None, "lock_frame": None if lock.frame is None else [round(v) for v in lock.frame],
                        "under": probe.label() if probe else "", "pinch": bool(pinch.closed),
                        "pinch_m": None if dist != dist else round(dist, 4),

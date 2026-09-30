@@ -271,16 +271,31 @@ def cursor_at(m, centre_m, anchor=0, frames=40):
 
 
 m0 = MetricMap(1728, 1117, pad=(0.24, 0.15))
-first = cursor_at(m0, (0.0, 0.02, 0.50))
-anchor_x = -(0.0 + hand[0][0])                     # the anchor landmark, mirrored, in metres from the camera line
-check(abs(first[0] - (1727 / 2 + anchor_x / 0.24 * 1727)) < 3 and abs(first[1] - 1116 / 2) < 1,
-      f"across is centred on the camera line, down on where the hand first appears ({first})")
+first = cursor_at(m0, (0.0, 0.02, 0.50), anchor=10, frames=200)   # anchor 10 sits 4 cm above the hand's lowest point
+anchor_x = -(0.0 + hand[10][0])                    # the anchor landmark, mirrored, in metres from the camera line
+check(abs(first[0] - (1727 / 2 + anchor_x / 0.24 * 1727)) < 3, f"across is centred on the camera line ({first})")
+check(abs(m0.below - 0.04) < 0.004, f"it learns how far the hand hangs below the anchor ({m0.below:.3f} m vs 0.04)")
+edge_y = m0.centre[1] + 0.075                      # the anchor's height at the pad's bottom edge
+at_edge = cursor_at(m0, (0.0, edge_y, 0.50), anchor=10, frames=200)
+lowest = max(p[1] for p in project(hand, (0.0, edge_y, 0.50)))
+check(abs(at_edge[1] - 1116) < 2 and abs(lowest - 0.95) < 0.01,
+      f"at the screen's bottom edge the whole hand is still in view (lowest point at {lowest:.3f} of the frame)")
+low = MetricMap(1728, 1117, pad=(0.24, 0.15))
+cursor_at(low, (0.0, 0.15, 0.50), anchor=10, frames=200)
+low.recenter_next = True
+cursor_at(low, (0.0, 0.15, 0.50), anchor=10, frames=200)
+check(low.centre[1] < 0.15 - 0.05, f"recenter with the hand at the frame's bottom still keeps the pad in view ({low.centre[1]:.3f} m)")
+high = MetricMap(1728, 1117, pad=(0.24, 0.15))
+cursor_at(high, (0.03, -0.05, 0.50), frames=60)
+high.recenter_next = True
+cursor_at(high, (0.03, -0.05, 0.50), frames=60)
+check(abs(high.centre[1] - (-0.05 + hand[0][1])) < 0.002, f"recenter higher up is kept as said ({high.centre[1]:.3f} m)")
 m = MetricMap(1728, 1117, pad=(0.24, 0.15))
-start = cursor_at(m, (0.05, 0.02, 0.50))
+start = cursor_at(m, (0.05, -0.02, 0.50))
 m.recenter_next = True
-start = cursor_at(m, (0.05, 0.02, 0.50))
+start = cursor_at(m, (0.05, -0.02, 0.50))
 check(abs(start[0] - 1727 / 2) < 1 and abs(start[1] - 1116 / 2) < 1, f"recenter makes the current position the centre ({start})")
-toward = cursor_at(m, (0.05, 0.02, 0.35))
+toward = cursor_at(m, (0.05, -0.02, 0.35))
 check(abs(toward[0] - start[0]) < 12 and abs(toward[1] - start[1]) < 12,
       f"moving 15 cm toward the camera, off-axis, barely moves the cursor ({start} -> {toward})")
 m2 = MetricMap(1728, 1117, pad=(0.24, 0.15))
@@ -297,6 +312,45 @@ check(near[0] > 1727 / 2, "the user's right is the cursor's right")
 check(abs((near[0] - 1727 / 2) - 0.02 / 0.24 * 1727) < 8, f"2 cm of a 24 cm pad is 1/12 of the screen ({near[0] - 863.5:.0f} px)")
 a = MetricMap(1728, 1117)
 check(a(0.5, 0.5, None, None, 1280, 720) is None, "no world landmarks, no metric position")
+
+# --- precision: slow movement moves the cursor less, the cursor catches up on quick moves ---
+from bench import Precision  # noqa: E402
+off = Precision(1.0)
+check(off((100.0, 100.0), 0.0) == (100.0, 100.0) and off((110.0, 100.0), 0.033) == (110.0, 100.0), "gain 1 is off")
+pr = Precision(0.35)
+t = 0.0
+pr((500.0, 500.0), t)
+for k in range(1, 31):                                  # 1 px per frame = 30 px/s: slow drift
+    t += 1 / 30
+    at = pr((500.0 + k, 500.0), t)
+check(abs(at[0] - (500 + 30 * 0.35)) < 0.5, f"a slow 30 px drift moves the cursor about a third of it ({at[0] - 500:.1f} px)")
+wob = Precision(0.35)
+t = 0.0
+wob((500.0, 500.0), t)
+xs = []
+for k in range(1, 61):                                  # a 3 px wobble back and forth (90 px/s, what gets past the filter)
+    t += 1 / 30
+    xs.append(wob((500.0 + (3 if k % 2 else 0), 500.0), t)[0])
+check(max(xs) - min(xs) < 3 * 0.35 + 0.2, f"a 3 px wobble shrinks to about 1 px ({max(xs) - min(xs):.1f})")
+for k in range(1, 16):                                  # then a quick 600 px move (40 px a frame = 1200 px/s)
+    t += 1 / 30
+    at = wob((503.0 + 40 * k, 500.0), t)
+check(abs(at[0] - (503 + 600)) < 15, f"a quick move brings the cursor back to the hand ({at[0] - 1103:+.1f} px off)")
+still = Precision(0.35)
+t = 0.0
+still((500.0, 500.0), t)
+for k in range(1, 21):                                  # a slow 20 px drift builds an offset
+    t += 1 / 30
+    at = still((500.0 + k, 500.0), t)
+held = []
+for k in range(20):                                     # then the hand holds still
+    t += 1 / 30
+    held.append(still((520.0, 500.0), t)[0])
+check(still.offset() > 10 and max(held) - min(held) < 1e-9, f"a still hand never pulls the cursor (offset {still.offset():.1f} px waits for a move)")
+gap = Precision(0.35)
+gap((100.0, 100.0), 0.0)
+gap((105.0, 100.0), 0.033)
+check(gap((300.0, 300.0), 0.5) == (300.0, 300.0), "after a gap in the frames the cursor starts at the hand's spot")
 
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)

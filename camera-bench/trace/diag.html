@@ -132,6 +132,7 @@ function numbers() {
     ['hand across, down (cm)', p.metric ? `${f(p.metric[0])}, ${f(p.metric[1])}` : '–'],
     ['distance from camera', f(p.dist_cm, 0, ' cm')], ['scale', f(p.px_per_m, 0, ' px/m')],
     ['mapped → cursor', off(p.raw, p.cursor)], ['smoothing lag', off(p.despiked, p.filtered)],
+    ['precision', p.precision != null && p.precision < 1 ? `slow moves × ${p.precision}, cursor ${off(p.filtered, p.precise)} from the hand's spot` : 'off'],
     ['locked', p.locked ? `yes${p.lock_frame ? ' on a control' : ''}` : 'no'], ['under the cursor', p.under || '–'],
     ['pinch', p.pinch ? `closed (${f(p.pinch_m * 100, 1, ' cm')})` : (p.pinch_m != null ? `open (${f(p.pinch_m * 100, 1, ' cm')})` : '–')],
     ['grab', p.grab ? `turning ${f(p.grab_dy, 0, ' px')}` : 'no'],
