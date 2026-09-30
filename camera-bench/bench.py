@@ -727,12 +727,49 @@ def load_aim_cal(sw, sh, path=AIM_CAL_PATH):
         return None
 
 
-def save_aim_cal(sw, sh, fit, eye, path=AIM_CAL_PATH):
+def save_aim_cal(sw, sh, fit, eye, path=AIM_CAL_PATH, rounds=None, through=None):
     import json
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
         json.dump({"screen": [sw, sh], "map": list(fit["map"]), "rms_px": round(fit["rms"], 1), "eye": eye,
-                   "dots": fit["dots"], "saved": time.strftime("%Y-%m-%d %H:%M:%S")}, f, indent=1)
+                   "dots": fit["dots"], "saved": time.strftime("%Y-%m-%d %H:%M:%S"), "through": through,
+                   "rounds": rounds or []}, f, indent=1)
+
+
+def load_aim_rounds(sw, sh, through, path=AIM_CAL_PATH):
+    """The saved calibration rounds, each a list of [dot x, dot y, hit X, hit Y], taken with this screen and ray."""
+    try:
+        import json
+        with open(path) as f:
+            d = json.load(f)
+        if d.get("screen") != [sw, sh] or d.get("through") != through:
+            return []
+        return [r for r in d.get("rounds") or [] if isinstance(r, list)]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+POOL_ROUNDS = 6            # the calibration fits over this many recent rounds
+POOL_ROUND_MAX_PX = 300    # a round whose own fit misses by more than this (the user moved mid-round) is left out
+
+
+def pool_rounds(rounds, physical, sw, sh):
+    """One fit over every usable recent round (user, live: "six more of these ... to account for people's lack of
+    hand-eye coordination"): each round's own aiming error averages out. Rounds that disagree with themselves are left
+    out. Returns (fit or None, rounds used, reason)."""
+    keep = []
+    for r in rounds[-POOL_ROUNDS:]:
+        c = AimCalibration(sw, sh)
+        c.got = [((q[0], q[1]), (q[2], q[3])) for q in r]
+        f, _ = c.fit(physical)
+        if f and f["rms"] <= POOL_ROUND_MAX_PX:
+            keep.append(r)
+    if not keep:
+        return None, 0, "no round fits itself within %d px" % POOL_ROUND_MAX_PX
+    c = AimCalibration(sw, sh)
+    c.got = [((q[0], q[1]), (q[2], q[3])) for r in keep for q in r]
+    f, why = c.fit(physical)
+    return f, len(keep), why
 
 
 class AimMap:
@@ -1979,16 +2016,26 @@ def main():
                     print(f"I,aimcal,dot {n},skipped,no steady aim in {aimcal.timeout:g} s", file=sys.stderr, flush=True)
                     sound.play("Basso")
                 if aimcal.done:
-                    fit, why = aimcal.fit(mapper.physical)
+                    own, why = aimcal.fit(mapper.physical)
+                    rounds = load_aim_rounds(sw, sh, args.aim_through)
+                    if aimcal.got:
+                        rounds.append([[round(dt[0]), round(dt[1]), round(h[0], 5), round(h[1], 5)] for dt, h in aimcal.got])
+                    rounds = rounds[-POOL_ROUNDS:]
+                    fit, used, why2 = pool_rounds(rounds, mapper.physical, sw, sh)
+                    this = f"this round {own['rms']:.0f} px" if own else f"this round unusable ({why})"
                     if fit:
                         mapper.map, mapper.calibrated = fit["map"], True
-                        save_aim_cal(sw, sh, fit, args.eye)
-                        misses = " ".join(str(d[2]) for d in fit["dots"])
-                        print(f"I,aimcal,done,rms {fit['rms']:.0f} px,misses px {misses},saved {AIM_CAL_PATH}",
-                              file=sys.stderr, flush=True)
+                        save_aim_cal(sw, sh, fit, args.eye, rounds=rounds, through=args.aim_through)
+                        print(f"I,aimcal,done,{this},pooled over {used} of {len(rounds)} rounds rms {fit['rms']:.0f} px,"
+                              f"saved {AIM_CAL_PATH}", file=sys.stderr, flush=True)
                         sound.play("Glass")
                     else:
-                        print(f"I,aimcal,failed,{why},keeping the previous map", file=sys.stderr, flush=True)
+                        if rounds:
+                            old = load_aim_cal(sw, sh)
+                            if old:
+                                save_aim_cal(sw, sh, {"map": old, "rms": 0.0, "dots": []}, args.eye, rounds=rounds,
+                                             through=args.aim_through)
+                        print(f"I,aimcal,failed,{this},{why2},keeping the previous map", file=sys.stderr, flush=True)
                         sound.play("Basso")
                     aimcal = None
                     dots.close()

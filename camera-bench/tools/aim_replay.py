@@ -25,7 +25,8 @@ import re
 import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
-from bench import AIM_CAL_PATH, AimCalibration, AimMap, EYE_CORNERS, save_aim_cal  # noqa: E402
+from bench import (AIM_CAL_PATH, POOL_ROUNDS, AimCalibration, AimMap, EYE_CORNERS, pool_rounds,  # noqa: E402
+                   save_aim_cal)
 
 W, H, SW, SH, MM = 1280, 720, 1728, 1117, (345.0, 223.0)
 START = re.compile(r"calibrate (the )?(pointing|pointer|aim|aiming)|(start|run|redo|repeat) (the )?calibration|"
@@ -123,7 +124,7 @@ def main():
             if f and g:
                 held += miss(f["map"], g)
         held.sort()
-        results[(th, dk)] = (pooled, allp)
+        results[(th, dk)] = (pooled, allp, per)
         cap = f"{len(allp)}/{5 * len(per)}"
         own_s = f"{sorted(own)[len(own) // 2]:.0f}" if own else "-"
         pooled_s = f"{pooled['rms']:.0f}" if pooled else "-"
@@ -131,12 +132,15 @@ def main():
         print(f"{th:>7} {dk:>6g} {cap:>9} {own_s:>8} {pooled_s:>7} {held_s:>19}")
     if args.write:
         th, dk = args.write.split(",")
-        pooled, allp = results[(th, float(dk))]
+        _, _, per = results[(th, float(dk))]
+        rounds = [[[round(dt[0]), round(dt[1]), round(h[0], 5), round(h[1], 5)] for dt, h in g] for g in per if g]
+        m = AimMap(SW, SH, MM, through=th)
+        pooled, used, why = pool_rounds(rounds, m.physical, SW, SH)
         if not pooled:
-            sys.exit("no pooled fit for that setting")
-        save_aim_cal(SW, SH, pooled, "mid")
-        print(f"wrote the pooled fit ({len(allp)} dots, rms {pooled['rms']:.0f} pt) for through {th}, depth {dk} to {AIM_CAL_PATH}")
-
+            sys.exit(f"no pooled fit for that setting: {why}")
+        save_aim_cal(SW, SH, pooled, "mid", through=th, rounds=rounds)
+        print(f"wrote the pooled fit over {used} of {len(rounds[-POOL_ROUNDS:])} recent rounds (rms {pooled['rms']:.0f} pt) "
+              f"for through {th}, depth {dk} to {AIM_CAL_PATH}")
 
 if __name__ == "__main__":
     main()

@@ -583,5 +583,21 @@ check("captured" not in events and len(cal.got) == 1, "a hand that has not moved
 events = [cal.feed(5 + k / 30, (-0.06, -0.03)) for k in range(60)]
 check("captured" in events, "it is once the aim has moved to the new dot")
 
+# pooling: recent rounds fit together, a round that disagrees with itself is left out
+from bench import pool_rounds, load_aim_rounds  # noqa: E402
+m = AimMap(SW, SH, MM, through="tip")
+good = []
+for k in range(3):
+    mm_, cal_ = run_calibration(IPD_M, eye, noise=1.0, seed=10 + k)
+    good.append([[dt[0], dt[1], h[0], h[1]] for dt, h in cal_.got])
+bad = [[q[0], q[1], q[2] + (0.10 if i % 2 else -0.10), q[3]] for i, q in enumerate(good[0])]   # a round that moved
+fit, used, why = pool_rounds(good + [bad], m.physical, SW, SH)
+check(fit is not None and used == 3, f"three good rounds pool, the one that moved is left out ({used}, {why})")
+with tempfile.TemporaryDirectory() as tmp:
+    path = os.path.join(tmp, "aim.json")
+    save_aim_cal(SW, SH, fit, "mid", path=path, rounds=good, through="tip")
+    check(len(load_aim_rounds(SW, SH, "tip", path=path)) == 3, "the rounds are saved with the calibration")
+    check(load_aim_rounds(SW, SH, "pip", path=path) == [], "rounds taken through another hand point are not reused")
+
 print("camera-bench: %d failures" % fails)
 sys.exit(1 if fails else 0)
