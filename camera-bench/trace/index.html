@@ -7,7 +7,9 @@
 <style>
   :root { --bg: #111418; --fg: #e8eaed; --muted: #8a9099; --path: #3b82f6; --start: #22c55e; --end: #ef4444; --trail: #fbbf24; --panel: #1b2027; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg); font: 15px/1.4 -apple-system, system-ui, sans-serif; overflow: hidden; cursor: crosshair; }
-  canvas { position: fixed; inset: 0; }
+  /* the canvas's CSS size must be the window: its pixel buffer is devicePixelRatio times larger, and without
+     this a Retina screen showed everything at twice the scale, drawn away from the real cursor (found live) */
+  canvas { position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; }
   #hud { position: fixed; top: 14px; left: 16px; right: 16px; display: flex; justify-content: space-between; gap: 16px; pointer-events: none; }
   #task { font-size: 20px; font-weight: 600; }
   #hint { color: var(--muted); max-width: 60ch; }
@@ -29,7 +31,11 @@
 // RMS of the second difference of the cursor track (how shaky, independent of where it is).
 const c = document.getElementById('c'), g = c.getContext('2d');
 let W, H;
-function size() { W = c.width = innerWidth * devicePixelRatio; H = c.height = innerHeight * devicePixelRatio; g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); }
+function size() {
+  W = c.width = Math.round(innerWidth * devicePixelRatio); H = c.height = Math.round(innerHeight * devicePixelRatio);
+  c.style.width = innerWidth + 'px'; c.style.height = innerHeight + 'px';
+  g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0);
+}
 addEventListener('resize', () => { size(); draw(); }); size();
 const w = () => innerWidth, h = () => innerHeight;
 const TASKS = [
@@ -75,7 +81,9 @@ function renderResults() {
 }
 addEventListener('pointermove', e => {
   const now = performance.now(); mouse = [e.clientX, e.clientY];
-  trail.push({ x: mouse[0], y: mouse[1], t: now });
+  // every OS cursor move since the last event, not just the last one (Safari/Chrome coalesce at the display rate)
+  const moves = e.getCoalescedEvents ? e.getCoalescedEvents() : [e];
+  for (const m of (moves.length ? moves : [e])) trail.push({ x: m.clientX, y: m.clientY, t: now });
   const task = TASKS[ti], pts = task.pts();
   if (state === 'wait') {
     if (dist(mouse, pts[0]) < R) { restSince = restSince ?? now; if (now - restSince > 300) { state = 'go'; track = [{ x: mouse[0], y: mouse[1], t: now }]; } }
@@ -85,7 +93,7 @@ addEventListener('pointermove', e => {
     if (task.hold) { if (now - track[0].t >= 3000) finish(); }
     else if (dist(mouse, pts[pts.length - 1]) < R && track.length > 10) finish();
   }
-  draw();
+  // no draw() here: the animation loop draws once per screen refresh, as late as possible
 });
 addEventListener('keydown', e => {
   if (e.key === 'r' || e.key === 'R') reset();
