@@ -40,6 +40,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 
 from frames import FrameWriter
@@ -1590,15 +1591,34 @@ def inspector_slots(AS, app):
     return [(f, el) for f, el, _ in sorted(col, key=lambda x: x[0][1])]
 
 
+def _press_async(AS, el):
+    """AXPress without waiting: Logic's plug-in menu tracks the mouse from inside the press, so the call blocks until
+    the menu closes and then fails with -25204 (seen live 2026-10-01). The menu is up within ~0.3 s regardless."""
+    AS.AXUIElementSetMessagingTimeout(el, 0.3)
+    threading.Thread(target=lambda: AS.AXUIElementPerformAction(el, "AXPress"), daemon=True).start()
+
+
 def open_menu(AS, app, timeout=1.5):
-    """The plug-in menu Logic opened, or None."""
+    """(menu, search field) of the plug-in menu Logic opened, or (None, None). The menu is not a child of the
+    application: it sits inside the Inspector's channel strip, and the search field in its first item takes the
+    keyboard focus, so the focused element's parents lead to it (surveyed live 2026-10-01)."""
     t_end = time.monotonic() + timeout
     while time.monotonic() < t_end:
-        for k in _ax(AS, app, "AXChildren") or []:
+        foc = _ax(AS, app, "AXFocusedUIElement")
+        node, search = foc, None
+        if foc is not None and str(_ax(AS, foc, "AXRole") or "") == "AXTextField":
+            search = foc
+        for _ in range(8):
+            if node is None:
+                break
+            if str(_ax(AS, node, "AXRole") or "") == "AXMenu":
+                return node, search
+            node = _ax(AS, node, "AXParent")
+        for k in _ax(AS, app, "AXChildren") or []:        # a context menu the old way
             if str(_ax(AS, k, "AXRole") or "") == "AXMenu":
-                return k
+                return k, None
         time.sleep(0.05)
-    return None
+    return None, None
 
 
 def menu_items(AS, menu):
@@ -1620,7 +1640,7 @@ def submenu(AS, item, timeout=1.0):
     for k in _ax(AS, item, "AXChildren") or []:
         if str(_ax(AS, k, "AXRole") or "") == "AXMenu" and menu_items(AS, k):
             return k
-    AS.AXUIElementPerformAction(item, "AXPress")
+    _press_async(AS, item)
     t_end = time.monotonic() + timeout
     while time.monotonic() < t_end:
         for k in _ax(AS, item, "AXChildren") or []:
@@ -1630,13 +1650,26 @@ def submenu(AS, item, timeout=1.0):
     return None
 
 
+def _choose(AS, item, want, slot):
+    """Presses a plug-in's menu item, then its layout (Stereo first) when Logic offers one."""
+    sub = submenu(AS, item, timeout=0.6)
+    if sub is not None:                             # a layout choice: Stereo, Mono, Dual Mono
+        choice = next((find_item(AS, sub, lay) for lay in LAYOUTS if find_item(AS, sub, lay) is not None), None)
+        if choice is None:
+            return False, f"menu left open: no layout under {want!r}"
+        _press_async(AS, choice)
+        return True, f"inserted {want} ({_ax_label(AS, choice)}) in slot {slot}"
+    _press_async(AS, item)
+    return True, f"inserted {want} in slot {slot}"
+
+
 def insert_plugin(cursor, slot, path):
-    """Inserts a plug-in into insert slot `slot` (1-8) of the selected track: presses that slot in the Inspector
-    (an empty slot opens Logic's plug-in menu), walks the menu by `path` ("Audio Units", maker, name; Logic's own:
-    category, name) and presses the last item, then a layout (Stereo first) if Logic offers one. Where the path
-    stops matching, the menu stays open at that level for the user to pick ("jumps ahead to the plugin menu").
-    slot 0 only reports what it sees. Returns (ok, what happened). Untested live as of 2026-09-30: every step
-    prints an I,insert line."""
+    """Inserts a plug-in into the selected track's first empty Audio FX slot in the Inspector (Logic always shows
+    one empty slot after the last filled one, so that is the adapter's free slot `slot`): presses it, which opens
+    Logic's plug-in menu, types the plug-in's name (the last element of `path`) into the menu's search field and
+    presses the item that matches, then a layout (Stereo first) if Logic offers one. Without a search field it
+    walks the menu by `path` ("Audio Units", maker, name; Logic's own: category, name). Where nothing matches,
+    the menu stays open for the user to pick. slot 0 only reports what it sees. Returns (ok, what happened)."""
     import ApplicationServices as AS
     app = logic_app(AS)
     if app is None:
@@ -1644,53 +1677,50 @@ def insert_plugin(cursor, slot, path):
     slots = inspector_slots(AS, app)
     print(f"I,insert,slots,{len(slots)}," + ";".join(f"{f[0]:.0f}/{f[1]:.0f}" for f, _ in slots), file=sys.stderr, flush=True)
     if slot == 0:
-        return True, f"{len(slots)} slots seen"
+        return True, f"{len(slots)} empty slots seen"
     if not slots:
-        return False, "no insert slots seen (is the Inspector shown?)"
-    if slot > len(slots):                           # the last slot seen may hold a plug-in: never press it instead
-        return False, f"slot {slot} not seen ({len(slots)} slots in the Inspector)"
-    f, el = slots[slot - 1]
+        return False, "no empty insert slot seen (is the Inspector shown?)"
+    f, el = slots[0]                                # the empty slot: never a filled one
     err, acts = AS.AXUIElementCopyActionNames(el, None)
     if err == 0 and acts and "AXPress" in set(acts):
-        AS.AXUIElementPerformAction(el, "AXPress")
+        _press_async(AS, el)
     else:
         x, y = f[0] + f[2] / 2, f[1] + f[3] / 2
         here = cursor.where()
         cursor.press(x, y)
         cursor.release(x, y)
         cursor.warp(*here)
-    menu = open_menu(AS, app)
+    menu, search = open_menu(AS, app)
     if menu is None:
         return False, f"no menu opened on slot {slot}"
+    want = path[-1] if path else ""
+    if search is not None and want:
+        AS.AXUIElementSetAttributeValue(search, "AXValue", want)
+        t_end = time.monotonic() + 1.0
+        item = None
+        while time.monotonic() < t_end and item is None:
+            time.sleep(0.15)
+            item = find_item(AS, menu, want)
+        if item is not None:
+            print(f"I,insert,search,{want},{_ax_label(AS, item)}", file=sys.stderr, flush=True)
+            return _choose(AS, item, want, slot)
+        seen = [_ax_label(AS, i) for i in menu_items(AS, menu)][:25]
+        print(f"I,insert,search-miss,{want},seen,{'|'.join(seen)}", file=sys.stderr, flush=True)
+        AS.AXUIElementSetAttributeValue(search, "AXValue", "")     # back to the full menu for the walk below
+        time.sleep(0.3)
     for k, want in enumerate(path):
         item = find_item(AS, menu, want)
         if item is None:
             seen = [_ax_label(AS, i) for i in menu_items(AS, menu)][:25]
             print(f"I,insert,missing,{want},seen,{'|'.join(seen)}", file=sys.stderr, flush=True)
             return False, f"menu left open: no {want!r}"
-        last = k == len(path) - 1
-        if not last:
+        if k < len(path) - 1:
             sub = submenu(AS, item)
             if sub is None:
                 return False, f"menu left open: {want!r} did not open"
             menu = sub
             continue
-        sub = None
-        for c in _ax(AS, item, "AXChildren") or []:
-            if str(_ax(AS, c, "AXRole") or "") == "AXMenu" and menu_items(AS, c):
-                sub = c
-        if sub is None:
-            AS.AXUIElementPerformAction(item, "AXPress")
-            time.sleep(0.15)
-            sub = next((c for c in (_ax(AS, item, "AXChildren") or []) if str(_ax(AS, c, "AXRole") or "") == "AXMenu"
-                        and menu_items(AS, c)), None)
-        if sub is not None:                         # a layout choice: Stereo, Mono, Dual Mono
-            choice = next((find_item(AS, sub, lay) for lay in LAYOUTS if find_item(AS, sub, lay) is not None), None)
-            if choice is None:
-                return False, f"menu left open: no layout under {want!r}"
-            AS.AXUIElementPerformAction(choice, "AXPress")
-            return True, f"inserted {want} ({_ax_label(AS, choice)}) in slot {slot}"
-        return True, f"inserted {want} in slot {slot}"
+        return _choose(AS, item, want, slot)
     return False, "empty path"
 
 
@@ -1715,6 +1745,113 @@ def close_window(probe, name):
             if btn is not None:
                 AS.AXUIElementPerformAction(btn, "AXPress")
                 return title or name
+    return None
+
+
+EDITOR_PANES = ("Piano Roll", "Score Editor", "Step Editor", "Audio File Editor", "Audio Track Editor",
+                "Smart Tempo Editor", "Event List", "Editor")
+
+
+def _logic_project_windows(probe):
+    app = logic_app(probe.AS)
+    if app is None:
+        return []
+    return [w for w in (probe._attr(app, "AXWindows") or []) if ".logicx" in str(probe._attr(w, "AXTitle") or "").lower()]
+
+
+def editor_showing(probe):
+    """The editor pane open at the bottom of Logic's project window ("Piano Roll", ...), or None. Its header group
+    carries the editor's name (surveyed live 2026-10-01: AXGroup "Piano Roll" 1263x37 under the Tracks window)."""
+    if probe is None or not probe.ok:
+        return None
+    for win in _logic_project_windows(probe):
+        wf = probe._frame(win)
+        stack, seen = [(win, 0)], 0
+        while stack and seen < 4000:
+            el, d = stack.pop()
+            seen += 1
+            lab = probe._label(el)
+            if lab in EDITOR_PANES and str(probe._attr(el, "AXRole") or "") in ("AXGroup", "AXLayoutArea"):
+                f = probe._frame(el)
+                if f and f[2] > 0 and f[3] > 0 and (wf is None or wf[1] <= f[1] < wf[1] + wf[3]):
+                    return lab
+            if d < 9:
+                stack.extend((k, d + 1) for k in (probe._attr(el, "AXChildren") or []))
+    return None
+
+
+def _track_elements(probe, win):
+    """[(n, element, has_focus_child)] of the track headers and lanes Logic shows in the project window: the elements
+    labelled 'Track n “name”' (a header's label may go on: '..., mute'); surveyed live 2026-10-01 (lanes are
+    AXLayoutAreas under 'Tracks content', headers hold a 'Has Focus' strip that selects the track when pressed)."""
+    pat = re.compile(r"^Track (\d+) “")
+    out, stack, seen = [], [(win, 0)], 0
+    while stack and seen < 8000:
+        el, d = stack.pop()
+        seen += 1
+        m = pat.match(probe._label(el))
+        if m:
+            focus = None
+            inner = [(k, 0) for k in (probe._attr(el, "AXChildren") or [])]
+            while inner:
+                k, dd = inner.pop()
+                if probe._label(k).lower() == "has focus":
+                    focus = k
+                    break
+                if dd < 3:
+                    inner.extend((c, dd + 1) for c in (probe._attr(k, "AXChildren") or []))
+            out.append((int(m.group(1)), el, focus))
+            continue
+        if d < 12:
+            stack.extend((k, d + 1) for k in (probe._attr(el, "AXChildren") or []))
+    return out
+
+
+def select_track(probe, cursor, n, tries=8):
+    """Selects track n in Logic's Tracks window: presses its header's focus strip (or clicks its lane), scrolling the
+    track list first when n is out of view (the adapter only knows the eight names of the current bank).
+    Returns the track's name, or None."""
+    if probe is None or not probe.ok:
+        return None
+    wins = _logic_project_windows(probe)
+    if not wins:
+        return None
+    win = wins[0]
+    for attempt in range(tries):
+        found = _track_elements(probe, win)
+        hits = [x for x in found if x[0] == n]
+        if hits:
+            hits.sort(key=lambda x: x[2] is None)            # a header with a focus strip first
+            _, el, focus = hits[0]
+            target = focus if focus is not None else el
+            err, acts = probe.AS.AXUIElementCopyActionNames(target, None)
+            if err == 0 and acts and "AXPress" in set(acts):
+                probe.AS.AXUIElementPerformAction(target, "AXPress")
+            else:
+                f = probe._frame(target)
+                if f is None:
+                    return None
+                here = cursor.where()
+                x, y = f[0] + min(12, f[2] / 2), f[1] + f[3] / 2
+                cursor.press(x, y)
+                cursor.release(x, y)
+                cursor.warp(*here)
+            m = re.match(r"^Track \d+ “(.+?)”", probe._label(el))
+            return m.group(1) if m else str(n)
+        nums = [x[0] for x in found]
+        if not nums:
+            return None
+        lane = next((x[1] for x in found if probe._frame(x[1]) and probe._frame(x[1])[2] > 400), found[0][1])
+        f = probe._frame(lane)
+        if f is None:
+            return None
+        rows = (n - max(nums)) if n > max(nums) else (n - min(nums))      # + = scroll down
+        here = cursor.where()
+        cursor.warp(f[0] + 40, f[1] + f[3] / 2)
+        cursor.scroll(0, 4 * rows)
+        cursor.warp(*here)
+        print(f"I,track,scroll,{rows:+d},visible {min(nums)}-{max(nums)}", file=sys.stderr, flush=True)
+        time.sleep(0.25)
     return None
 
 
@@ -2265,6 +2402,25 @@ def main():
                             raise ValueError("hands off")
                         cursor.scroll(float(parts[1]), float(parts[2]))
                         print(f"I,scroll,{parts[1]},{parts[2]}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["editor"] and len(parts) == 2 and parts[1] in ("hide", "show"):
+                        # the editor pane under the tracks: View > Editor (E) toggles it, so hide only when one shows
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        showing = editor_showing(probe)
+                        if parts[1] == "hide":
+                            if showing is None:
+                                raise ValueError("no editor pane is showing")
+                            cursor.key("e")
+                        elif showing is None:
+                            cursor.key("p")
+                        print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["track"] and len(parts) == 2 and parts[1].isdigit():
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        name = select_track(probe, cursor, int(parts[1]))
+                        if name is None:
+                            raise ValueError(f"no track {parts[1]} in the Tracks window")
+                        print(f"I,track,{parts[1]},{name}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["closewin"] and len(parts) >= 2:
                         if not cursor.enabled:
                             raise ValueError("hands off")
