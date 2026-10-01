@@ -497,10 +497,28 @@ def rect_distance(p, frame):
     return math.hypot(dx, dy)
 
 
+def rank_near(pos, controls, radius=None, limit=None):
+    """The controls a "this"/"that" could mean: those within `radius` px of pos, nearest first, each frame once.
+    `controls` is [(role, frame, name)]; the result is [[role, name, x, y, w, h, distance]] for the frame record."""
+    radius = NEAR_RADIUS if radius is None else radius
+    limit = NEAR_MAX if limit is None else limit
+    best = {}
+    for role, f, name in controls:
+        if f is None:
+            continue
+        key = tuple(int(round(v)) for v in f)
+        d = rect_distance(pos, f)
+        if d <= radius and (key not in best or d < best[key][-1]):
+            best[key] = [role, (name or "")[:40], *key, int(round(d))]
+    return sorted(best.values(), key=lambda r: r[-1])[:limit]
+
+
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
                  "AXIncrementor", "AXValueIndicator", "AXMenuItem", "AXMenuBarItem", "AXDisclosureTriangle",
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
 TEXT_BAR_MAX_H = 60          # px: a single-line text field this tall or less is a lock target
+NEAR_RADIUS = 400         # px: the recorded nearby controls reach past the aim's p90 miss (357 px, live 2026-09-30)
+NEAR_MAX = 8              # controls per recorded snapshot, nearest first
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
@@ -584,6 +602,8 @@ class AXProbe:
         self.pos = None
         self.found = None          # (t, role, (x, y, w, h), title, is_control)
         self.cache = {}            # container key -> (t, [(role, frame, name)]) for the zone search
+        self.near = None           # the last nearby-controls snapshot (see start_near), for the frame record
+        self.near_on = False
         self.ok = False
         try:
             import ApplicationServices as AS
@@ -731,6 +751,75 @@ class AXProbe:
                 self.found = (time.monotonic(), role, frame, name, is_control)
             except Exception:
                 self.found = (time.monotonic(), None, None, "", False)
+
+    def start_near(self, period=0.5):
+        """Records, on a second thread, the controls within NEAR_RADIUS of the cursor plus the front app and window,
+        about twice a second while the cursor moves (every 2 s when it rests). Sessions then hold what a spoken
+        "this" could have meant: the data for the intent model (~/.claude/plans/not-quite-yet-i-sparkling-sutherland.md).
+        Its own thread, so the 5-30 ms lookups never slow the hover probe."""
+        if self.near_on or not self.ok:
+            return
+        self.near_on = True
+        import threading
+        threading.Thread(target=self._run_near, args=(period,), name="ax-near", daemon=True).start()
+
+    def _gather(self, pos):
+        """[(role, frame, name)] of the controls around pos: the elements at 17 points (pos, and 8 each at half and
+        full radius), their containers' controls and the containers above those. A point inside a container already
+        read is skipped, so a mixer read whole costs a few lookups, not 17."""
+        r = NEAR_RADIUS
+        pts = [pos] + [(pos[0] + r * f * math.cos(i * math.pi / 4), pos[1] + r * f * math.sin(i * math.pi / 4))
+                       for f in (0.5, 1.0) for i in range(8)]
+        scanned, controls = [], []
+        for p in pts:
+            if any(x <= p[0] <= x + w and y <= p[1] <= y + h for x, y, w, h in scanned):
+                continue
+            err, el = self.AS.AXUIElementCopyElementAtPosition(self.sys, p[0], p[1], None)
+            if err != 0 or el is None:
+                continue
+            role, frame, name, is_control = self.classify(el)
+            if is_control and frame:
+                controls.append((role, self._knob(el, frame) if role == "AXSlider" else frame, name))
+            node = self._attr(el, "AXParent") if is_control else el
+            for _ in range(2):
+                if node is None:
+                    break
+                fr = self._frame(node)
+                if fr is None or fr[2] * fr[3] > 500 * 1100:    # never a whole window, as in the zone search
+                    break
+                controls.extend(self._controls_in(node))
+                scanned.append(fr)
+                node = self._attr(node, "AXParent")
+        return controls
+
+    def _context(self):
+        """(front app name, its focused window's title): which Logic window the user is in. Asked through NSWorkspace:
+        the system-wide AXFocusedApplication fails from this process (-25204, measured)."""
+        import AppKit
+        front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+        if front is None:
+            return "", ""
+        win = self._attr(self.AS.AXUIElementCreateApplication(front.processIdentifier()), "AXFocusedWindow")
+        return str(front.localizedName() or ""), str(self._attr(win, "AXTitle") or "") if win is not None else ""
+
+    def _run_near(self, period):
+        last, last_t = None, 0.0
+        while True:
+            time.sleep(period)
+            pos = self.pos
+            if pos is None:
+                continue
+            now = time.monotonic()
+            if last is not None and math.hypot(pos[0] - last[0], pos[1] - last[1]) < 20 and now - last_t < 2.0:
+                continue
+            try:
+                app, win = self._context()
+                near = rank_near(pos, self._gather(pos))
+            except Exception:
+                continue
+            last, last_t = pos, now
+            self.near = {"at": [int(round(pos[0])), int(round(pos[1]))], "app": app[:40], "win": win[:80],
+                         "near": near}
 
     def verify(self, pos):
         """Right before a grab presses: is the element at exactly this point a slider or knob (or part of one)? One
@@ -2048,6 +2137,7 @@ def main():
             base_options=mpt.BaseOptions(model_asset_path=FACE_MODEL, delegate=mpt.BaseOptions.Delegate.CPU),
             running_mode=vision.RunningMode.VIDEO, num_faces=1))
     frames_out = FrameWriter(args.frames, cw, ch) if args.frames else None
+    near_written = None           # the probe's nearby-controls snapshot last put on a frame
     clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
 
     log_file = open(args.log, "w", newline="") if args.log else None
@@ -2413,6 +2503,13 @@ def main():
                 extra = {"grab": grab_state} if grab_state else {}
                 if isinstance(mapper, AimMap) and mapper.eyes:
                     extra["eyes"] = [[round(v, 4) for v in e] for e in mapper.eyes]   # aim replays need the eyes too
+                if pos is not None:
+                    extra["ptr"] = [int(round(pos[0])), int(round(pos[1]))]           # where the cursor is
+                if probe is not None:
+                    probe.start_near()                    # once; the probe may have been turned on live
+                    snap = probe.near
+                    if snap is not None and snap is not near_written:   # the controls around it, once per snapshot
+                        extra["near"] = near_written = snap
                 frames_out.write(*pending_frame, extra=extra or None)
                 pending_frame = None
             t_post = time.perf_counter()

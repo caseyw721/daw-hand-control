@@ -382,6 +382,18 @@ bare.ok = False
 check(bare._knob(None, (728, 382, 25, 25)) == (728, 382, 25, 25),
       "a knob keeps its own frame (its offset value box put a press on the track header, live)")
 check(bare.verify((10, 10)) == (True, "no Accessibility"), "without Accessibility the press check cannot refuse")
+bare.near_on = False
+bare.start_near()
+check(not bare.near_on, "without Accessibility no nearby-controls thread starts")
+# --- the recorded nearby controls: within the radius, nearest first, each once ---
+from bench import rank_near  # noqa: E402
+ctl = [("AXSlider", (100, 100, 20, 180), "volume"), ("AXSlider", (100.2, 100, 20, 180), "volume"),
+       ("AXButton", (300, 100, 20, 20), "mute"), ("AXButton", (900, 100, 20, 20), "far"),
+       ("AXSlider", (90, 60, 25, 25), "pan"), ("AXButton", None, "no frame")]
+near = rank_near((110, 150), ctl)
+check([r[1] for r in near] == ["volume", "pan", "mute"], f"inside first, then by distance, far and frameless left out ({near})")
+check(near[0] == ["AXSlider", "volume", 100, 100, 20, 180, 0], f"a row is role, name, frame, distance ({near[0]})")
+check(len(rank_near((110, 150), ctl * 3, limit=2)) == 2, "at most `limit` controls")
 # --- a closed hand ---
 flat = [(0.0, 0.0, 0.0)] * 21
 straight = list(flat)
