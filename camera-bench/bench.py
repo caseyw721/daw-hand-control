@@ -1807,6 +1807,40 @@ def _track_elements(probe, win):
     return out
 
 
+def open_slot(probe, name):
+    """Opens the plug-in (or instrument) called `name` on the selected track from the Inspector: a filled slot there
+    is a group named after it with an "open" button (surveyed live 2026-10-01: AXGroup "SubLab" > AXButton "open").
+    The adapter's `open NAME` only knows the Audio FX slots, so an instrument like SubLab needs this. Returns the
+    slot's name, or None."""
+    if probe is None or not probe.ok:
+        return None
+    want = re.sub(r"[^a-z0-9]", "", name.lower())
+    if not want:
+        return None
+    for win in _logic_project_windows(probe):
+        stack, seen, inside_found = [(win, 0, False)], 0, []
+        while stack and seen < 6000:
+            el, d, inside = stack.pop()
+            seen += 1
+            lab = probe._label(el)
+            inside = inside or lab == "Inspector"
+            if inside and str(probe._attr(el, "AXRole") or "") == "AXGroup" and lab:
+                key = re.sub(r"[^a-z0-9]", "", lab.lower())
+                if key and (key == want or key.startswith(want) or want in key):
+                    btn = next((k for k in (probe._attr(el, "AXChildren") or []) if probe._label(k).lower() == "open"), None)
+                    f = probe._frame(el)
+                    if btn is not None and f:
+                        inside_found.append((f[0], f[1], btn, lab))
+            if d < 12:
+                stack.extend((k, d + 1, inside) for k in (probe._attr(el, "AXChildren") or []))
+        if inside_found:
+            inside_found.sort()                      # the left strip (the selected track) before the output's
+            _, _, btn, lab = inside_found[0]
+            probe.AS.AXUIElementPerformAction(btn, "AXPress")
+            return lab
+    return None
+
+
 def select_track(probe, cursor, n, tries=8):
     """Selects track n in Logic's Tracks window: presses its header's focus strip (or clicks its lane), scrolling the
     track list first when n is out of view (the adapter only knows the eight names of the current bank).
@@ -2414,6 +2448,13 @@ def main():
                         elif showing is None:
                             cursor.key("p")
                         print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["openslot"] and len(parts) >= 2:
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        opened = open_slot(probe, " ".join(parts[1:]))
+                        if opened is None:
+                            raise ValueError(f"no slot named {' '.join(parts[1:])!r} on the selected track")
+                        print(f"I,openslot,{opened}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["track"] and len(parts) == 2 and parts[1].isdigit():
                         if not cursor.enabled:
                             raise ValueError("hands off")
