@@ -499,18 +499,20 @@ def rect_distance(p, frame):
 
 def rank_near(pos, controls, radius=None, limit=None):
     """The controls a "this"/"that" could mean: those within `radius` px of pos, nearest first, each frame once.
-    `controls` is [(role, frame, name)]; the result is [[role, name, x, y, w, h, distance]] for the frame record."""
+    `controls` is [(role, frame, name[, where])]; the result is [[role, name, x, y, w, h, distance, where]] for the
+    frame record (where: the named group around it, e.g. 'Track 3 “Bass”')."""
     radius = NEAR_RADIUS if radius is None else radius
     limit = NEAR_MAX if limit is None else limit
     best = {}
-    for role, f, name in controls:
+    for c in controls:
+        role, f, name = c[:3]
         if f is None:
             continue
         key = tuple(int(round(v)) for v in f)
         d = rect_distance(pos, f)
-        if d <= radius and (key not in best or d < best[key][-1]):
-            best[key] = [role, (name or "")[:40], *key, int(round(d))]
-    return sorted(best.values(), key=lambda r: r[-1])[:limit]
+        if d <= radius and (key not in best or d < best[key][6]):
+            best[key] = [role, (name or "")[:40], *key, int(round(d)), (c[3] if len(c) > 3 else "")[:60]]
+    return sorted(best.values(), key=lambda r: r[6])[:limit]
 
 
 CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXSlider",
@@ -684,28 +686,34 @@ class AXProbe:
         return frame
 
     def _controls_in(self, node, depth=3, limit=160):
-        """Controls among a container's descendants: [(role, frame, name)], cached for 2 s per container."""
+        """Controls among a container's descendants: [(role, frame, name, where)], cached for 2 s per container.
+        `where` is the nearest named group around the control, the container's own name included: Logic's mute
+        button is just "Mute", its group 'Track 3 “Bass”' says which track (surveyed live, tools/ax_snapshot.py)."""
         key = (str(self._attr(node, "AXRole") or ""), self._frame(node))
         hit = self.cache.get(key)
         if hit and time.monotonic() - hit[0] < 2.0:
             return hit[1]
-        out, stack, seen = [], [(node, 0)], 0
+        out, stack, seen = [], [(node, 0, self._label(node))], 0
         while stack and seen < limit:
-            el, d = stack.pop()
+            el, d, where = stack.pop()
             seen += 1
             if d > 0:
                 role, frame, name, is_control = self.classify(el)
                 if is_control and frame and frame[2] * frame[3] <= 300 * 300:
                     if role == "AXSlider":
                         frame = self._knob(el, frame)
-                    out.append((role, frame, name))
+                    out.append((role, frame, name, where))
                     continue
             if d < depth:
-                stack.extend((k, d + 1) for k in (self._attr(el, "AXChildren") or []))
+                inner = (self._label(el) or where) if d > 0 else where
+                stack.extend((k, d + 1, inner) for k in (self._attr(el, "AXChildren") or []))
         if len(self.cache) > 64:
             self.cache.clear()
         self.cache[key] = (time.monotonic(), out)
         return out
+
+    def _label(self, el):
+        return str(self._attr(el, "AXDescription") or self._attr(el, "AXTitle") or "")
 
     def _nearby(self, el, pos):
         """The nearest control within `zone` px of pos, searching the element under the cursor and up to two of its
@@ -718,7 +726,7 @@ class AXProbe:
             if frame is None or frame[2] * frame[3] > 500 * 1100:
                 break
             best = None
-            for role, f, name in self._controls_in(node):
+            for role, f, name, _where in self._controls_in(node):
                 d = rect_distance(pos, f)
                 if d <= self.zone and (best is None or d < best[0]):
                     best = (d, role, f, name)
@@ -779,7 +787,9 @@ class AXProbe:
                 continue
             role, frame, name, is_control = self.classify(el)
             if is_control and frame:
-                controls.append((role, self._knob(el, frame) if role == "AXSlider" else frame, name))
+                parent = self._attr(el, "AXParent")
+                controls.append((role, self._knob(el, frame) if role == "AXSlider" else frame, name,
+                                 self._label(parent) if parent is not None else ""))
             node = self._attr(el, "AXParent") if is_control else el
             for _ in range(2):
                 if node is None:

@@ -392,7 +392,9 @@ ctl = [("AXSlider", (100, 100, 20, 180), "volume"), ("AXSlider", (100.2, 100, 20
        ("AXSlider", (90, 60, 25, 25), "pan"), ("AXButton", None, "no frame")]
 near = rank_near((110, 150), ctl)
 check([r[1] for r in near] == ["volume", "pan", "mute"], f"inside first, then by distance, far and frameless left out ({near})")
-check(near[0] == ["AXSlider", "volume", 100, 100, 20, 180, 0], f"a row is role, name, frame, distance ({near[0]})")
+check(near[0] == ["AXSlider", "volume", 100, 100, 20, 180, 0, ""], f"a row is role, name, frame, distance, where ({near[0]})")
+check(rank_near((0, 0), [("AXCheckBox", (0, 0, 20, 20), "Mute", "Track 3 “Bass”")])[0][7] == "Track 3 “Bass”",
+      "the named group around a control rides along")
 check(len(rank_near((110, 150), ctl * 3, limit=2)) == 2, "at most `limit` controls")
 # --- a closed hand ---
 flat = [(0.0, 0.0, 0.0)] * 21
