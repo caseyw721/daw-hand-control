@@ -1647,7 +1647,9 @@ def insert_plugin(cursor, slot, path):
         return True, f"{len(slots)} slots seen"
     if not slots:
         return False, "no insert slots seen (is the Inspector shown?)"
-    f, el = slots[min(slot, len(slots)) - 1]
+    if slot > len(slots):                           # the last slot seen may hold a plug-in: never press it instead
+        return False, f"slot {slot} not seen ({len(slots)} slots in the Inspector)"
+    f, el = slots[slot - 1]
     err, acts = AS.AXUIElementCopyActionNames(el, None)
     if err == 0 and acts and "AXPress" in set(acts):
         AS.AXUIElementPerformAction(el, "AXPress")
