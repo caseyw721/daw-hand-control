@@ -2850,6 +2850,10 @@ def main():
                             a = grab.step(t_det, free)
                             if a and a[0] == "press":
                                 ok_here, what = probe.verify((a[1], a[2])) if (probe and grab.mode == "drag") else (True, "")
+                                if not (0 <= a[1] < sw and 0 <= a[2] < sh):
+                                    # the aim is not clamped, and a grab-anywhere press off the screen would land on the
+                                    # menu bar or the Dock (live 2026-10-01: presses at y = -16 and -225)
+                                    ok_here, what = False, "off-screen"
                                 if ok_here:
                                     cursor.press(a[1], a[2])
                                     print(f"I,grab,press,{a[1]:.0f},{a[2]:.0f},{what}", file=sys.stderr, flush=True)
