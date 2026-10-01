@@ -37,6 +37,7 @@ import collections
 import csv
 import math
 import os
+import re
 import subprocess
 import sys
 import time
@@ -1537,6 +1538,160 @@ def press_at(probe, cursor, x, y):
     return "click"
 
 
+LAYOUTS = ("Stereo", "Mono", "Mono → Stereo", "Mono->Stereo", "Dual Mono")
+
+
+def _ax(AS, el, name):
+    err, v = AS.AXUIElementCopyAttributeValue(el, name, None)
+    return v if err == 0 else None
+
+
+def _ax_label(AS, el):
+    return str(_ax(AS, el, "AXTitle") or _ax(AS, el, "AXDescription") or "")
+
+
+def _ax_frame(AS, el):
+    pos, size = _ax(AS, el, "AXPosition"), _ax(AS, el, "AXSize")
+    if pos is None or size is None:
+        return None
+    _, pt = AS.AXValueGetValue(pos, AS.kAXValueCGPointType, None)
+    _, sz = AS.AXValueGetValue(size, AS.kAXValueCGSizeType, None)
+    return (pt.x, pt.y, sz.width, sz.height)
+
+
+def logic_app(AS):
+    import AppKit
+    apps = [a for a in AppKit.NSWorkspace.sharedWorkspace().runningApplications() if a.localizedName() == "Logic Pro"]
+    return AS.AXUIElementCreateApplication(apps[0].processIdentifier()) if apps else None
+
+
+def inspector_slots(AS, app):
+    """The insert slots of the selected track's channel strip in Logic's Inspector, top to bottom: the elements
+    labelled as an audio plug-in in the Inspector's left-most strip (the right one is the output's). [] when the
+    Inspector is hidden."""
+    found = []
+    for win in _ax(AS, app, "AXWindows") or []:
+        stack = [(win, 0, False)]
+        while stack:
+            el, d, inside = stack.pop()
+            lab = _ax_label(AS, el)
+            inside = inside or lab == "Inspector"
+            if inside and re.search(r"audio plug-?in|audio fx|insert", lab, re.I):
+                f = _ax_frame(AS, el)
+                if f:
+                    found.append((f, el, lab))
+                continue
+            if d < 12:
+                stack.extend((k, d + 1, inside) for k in (_ax(AS, el, "AXChildren") or []))
+    if not found:
+        return []
+    left = min(f[0] for f, _, _ in found)
+    col = [x for x in found if abs(x[0][0] - left) < 30]
+    return [(f, el) for f, el, _ in sorted(col, key=lambda x: x[0][1])]
+
+
+def open_menu(AS, app, timeout=1.5):
+    """The plug-in menu Logic opened, or None."""
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        for k in _ax(AS, app, "AXChildren") or []:
+            if str(_ax(AS, k, "AXRole") or "") == "AXMenu":
+                return k
+        time.sleep(0.05)
+    return None
+
+
+def menu_items(AS, menu):
+    return [k for k in (_ax(AS, menu, "AXChildren") or []) if str(_ax(AS, k, "AXRole") or "") == "AXMenuItem"]
+
+
+def find_item(AS, menu, want):
+    items = menu_items(AS, menu)
+    w = want.strip().lower()
+    for test in (lambda t: t == w, lambda t: t.startswith(w), lambda t: w in t):
+        for it in items:
+            if test(_ax_label(AS, it).strip().lower()):
+                return it
+    return None
+
+
+def submenu(AS, item, timeout=1.0):
+    """The submenu under a menu item, opening it if Logic builds it lazily."""
+    for k in _ax(AS, item, "AXChildren") or []:
+        if str(_ax(AS, k, "AXRole") or "") == "AXMenu" and menu_items(AS, k):
+            return k
+    AS.AXUIElementPerformAction(item, "AXPress")
+    t_end = time.monotonic() + timeout
+    while time.monotonic() < t_end:
+        for k in _ax(AS, item, "AXChildren") or []:
+            if str(_ax(AS, k, "AXRole") or "") == "AXMenu" and menu_items(AS, k):
+                return k
+        time.sleep(0.05)
+    return None
+
+
+def insert_plugin(cursor, slot, path):
+    """Inserts a plug-in into insert slot `slot` (1-8) of the selected track: presses that slot in the Inspector
+    (an empty slot opens Logic's plug-in menu), walks the menu by `path` ("Audio Units", maker, name; Logic's own:
+    category, name) and presses the last item, then a layout (Stereo first) if Logic offers one. Where the path
+    stops matching, the menu stays open at that level for the user to pick ("jumps ahead to the plugin menu").
+    slot 0 only reports what it sees. Returns (ok, what happened). Untested live as of 2026-09-30: every step
+    prints an I,insert line."""
+    import ApplicationServices as AS
+    app = logic_app(AS)
+    if app is None:
+        return False, "Logic is not running"
+    slots = inspector_slots(AS, app)
+    print(f"I,insert,slots,{len(slots)}," + ";".join(f"{f[0]:.0f}/{f[1]:.0f}" for f, _ in slots), file=sys.stderr, flush=True)
+    if slot == 0:
+        return True, f"{len(slots)} slots seen"
+    if not slots:
+        return False, "no insert slots seen (is the Inspector shown?)"
+    f, el = slots[min(slot, len(slots)) - 1]
+    err, acts = AS.AXUIElementCopyActionNames(el, None)
+    if err == 0 and acts and "AXPress" in set(acts):
+        AS.AXUIElementPerformAction(el, "AXPress")
+    else:
+        x, y = f[0] + f[2] / 2, f[1] + f[3] / 2
+        here = cursor.where()
+        cursor.press(x, y)
+        cursor.release(x, y)
+        cursor.warp(*here)
+    menu = open_menu(AS, app)
+    if menu is None:
+        return False, f"no menu opened on slot {slot}"
+    for k, want in enumerate(path):
+        item = find_item(AS, menu, want)
+        if item is None:
+            seen = [_ax_label(AS, i) for i in menu_items(AS, menu)][:25]
+            print(f"I,insert,missing,{want},seen,{'|'.join(seen)}", file=sys.stderr, flush=True)
+            return False, f"menu left open: no {want!r}"
+        last = k == len(path) - 1
+        if not last:
+            sub = submenu(AS, item)
+            if sub is None:
+                return False, f"menu left open: {want!r} did not open"
+            menu = sub
+            continue
+        sub = None
+        for c in _ax(AS, item, "AXChildren") or []:
+            if str(_ax(AS, c, "AXRole") or "") == "AXMenu" and menu_items(AS, c):
+                sub = c
+        if sub is None:
+            AS.AXUIElementPerformAction(item, "AXPress")
+            time.sleep(0.15)
+            sub = next((c for c in (_ax(AS, item, "AXChildren") or []) if str(_ax(AS, c, "AXRole") or "") == "AXMenu"
+                        and menu_items(AS, c)), None)
+        if sub is not None:                         # a layout choice: Stereo, Mono, Dual Mono
+            choice = next((find_item(AS, sub, lay) for lay in LAYOUTS if find_item(AS, sub, lay) is not None), None)
+            if choice is None:
+                return False, f"menu left open: no layout under {want!r}"
+            AS.AXUIElementPerformAction(choice, "AXPress")
+            return True, f"inserted {want} ({_ax_label(AS, choice)}) in slot {slot}"
+        return True, f"inserted {want} in slot {slot}"
+    return False, "empty path"
+
+
 def close_window(probe, name):
     """Closes the front app's window whose title, or a top-level group inside it, contains `name` (a plug-in window
     in Logic is titled by its track, its plug-in's name is the group inside). Never the project window. Returns
@@ -2096,6 +2251,13 @@ def main():
                         print(f"I,hold,{float(parts[1]):.0f},{float(parts[2]):.0f}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["release"] and len(parts) == 1:
                         nonlocal_state["release"] = True
+                    elif parts[:1] == ["insert"] and len(parts) >= 3 and parts[1].isdigit():
+                        if not cursor.enabled and parts[1] != "0":
+                            raise ValueError("hands off")
+                        path = [x.strip() for x in raw.strip().split(None, 2)[2].split("|") if x.strip()]
+                        ok, what = insert_plugin(cursor, int(parts[1]), path)
+                        print(f"I,insert,{'ok' if ok else 'stopped'},{what}", file=sys.stderr, flush=True)
+                        sound.play("Glass" if ok else "Basso")
                     elif parts[:1] == ["scroll"] and len(parts) == 3:
                         if not cursor.enabled:
                             raise ValueError("hands off")

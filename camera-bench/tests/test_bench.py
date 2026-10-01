@@ -399,6 +399,30 @@ check(press_at(bare, fc, 100, 200) == "click" and fc.log == [("press", 100, 200)
       f"press_at without Accessibility clicks and puts the cursor back ({fc.log})")
 check(close_window(bare, "sublab") is None, "close_window without Accessibility closes nothing")
 Cursor(enabled=False).scroll(0, 3)   # disabled: a no-op
+# --- the plug-in menu walker over fake Accessibility elements: Audio Units > FabFilter > Pro-Q 4 > Stereo ---
+import bench as _b  # noqa: E402
+class El:
+    def __init__(self, role, title="", kids=()):
+        self.role, self.title, self.kids, self.pressed = role, title, list(kids), 0
+class FakeAS:
+    def AXUIElementCopyAttributeValue(self, el, name, _):
+        v = {"AXRole": el.role, "AXTitle": el.title, "AXDescription": "", "AXChildren": el.kids}.get(name)
+        return (0, v) if v is not None else (-25205, None)
+    def AXUIElementPerformAction(self, el, action):
+        el.pressed += 1
+        return 0
+stereo = El("AXMenuItem", "Stereo"); mono = El("AXMenuItem", "Mono")
+proq = El("AXMenuItem", "Pro-Q 4", [El("AXMenu", "", [mono, stereo])])
+fab = El("AXMenuItem", "FabFilter", [El("AXMenu", "", [proq])])
+aus = El("AXMenuItem", "Audio Units", [El("AXMenu", "", [El("AXMenuItem", "Apple"), fab])])
+top = El("AXMenu", "", [El("AXMenuItem", "No Plug-in"), El("AXMenuItem", "EQ"), aus])
+FA = FakeAS()
+check(_b.find_item(FA, top, "audio units") is aus, "menu items match case-blind")
+check(_b.find_item(FA, top, "Audio") is aus, "and by prefix")
+check(_b.submenu(FA, aus) is aus.kids[0], "a submenu already built is read without pressing")
+check(_b.find_item(FA, _b.submenu(FA, fab), "Pro-Q 4") is proq, "the walk reaches the plug-in")
+check(next(_b.find_item(FA, proq.kids[0], lay) for lay in _b.LAYOUTS if _b.find_item(FA, proq.kids[0], lay)) is stereo,
+      "Stereo is the layout picked first")
 # --- the recorded nearby controls: within the radius, nearest first, each once ---
 from bench import rank_near  # noqa: E402
 ctl = [("AXSlider", (100, 100, 20, 180), "volume"), ("AXSlider", (100.2, 100, 20, 180), "volume"),
