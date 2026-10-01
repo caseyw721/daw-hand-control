@@ -211,6 +211,7 @@ class Nudge:
         return aim
 
 
+GRAB_MINCUTOFF, GRAB_BETA = 0.4, 0.004   # 1-euro filter on the drag source: steady at rest, still follows a deliberate move
 GRAB_HAND_PX = 1.5           # aim-mode drags: screen px per camera px of the hand's base (x grab gain); ~6 cm = a fader
 TAP_S = 0.4                  # the finger gun: a trigger press shorter than this that did not grab is a click
 REWIND_S = 0.6               # aim mode: how far back a pinch or grip looks for where the cursor was before it began
@@ -2354,6 +2355,7 @@ def main():
     mapper = make_mapper(args.mode)
     nonlocal_state = {}           # requests from the control thread, applied between frames by the main loop
     fx, fy = OneEuro(args.mincutoff, args.beta), OneEuro(args.mincutoff, args.beta)
+    gx, gy = OneEuro(GRAB_MINCUTOFF, GRAB_BETA), OneEuro(GRAB_MINCUTOFF, GRAB_BETA)   # the drag source (aim mode)
     lock = Lock(args.lock_ms / 1000, args.lock_speed, args.breakout, anywhere=args.lock_anywhere, zone=args.zone)
     grab = Grab(args.grab, args.grab_gain)
     diag = None
@@ -2827,7 +2829,9 @@ def main():
                         # magnifies every wobble, and a fader grab jumped 841 px (user, live: "freaking all over the place")
                         bx = sum(lm[k][0] for k in AIM_THROUGH["base"]) / 5
                         by = sum(lm[k][1] for k in AIM_THROUGH["base"]) / 5
-                        free = (-bx * cw * GRAB_HAND_PX, by * ch * GRAB_HAND_PX)
+                        # low-passed: the raw landmarks shook the knob (user, live 2026-10-01: "shaking all over the
+                        # place ... these need to be precise"); a heavier filter than the cursor's, lag is fine on a drag
+                        free = (gx(-bx * cw * GRAB_HAND_PX, t_det), gy(by * ch * GRAB_HAND_PX, t_det))
                     else:
                         free = pos
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
