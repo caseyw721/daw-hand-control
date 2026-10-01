@@ -520,7 +520,8 @@ CONTROL_ROLES = {"AXButton", "AXCheckBox", "AXRadioButton", "AXPopUpButton", "AX
                  "AXComboBox", "AXColorWell", "AXLevelIndicator", "AXDockItem", "AXCell", "AXLink", "AXTab"}
 TEXT_BAR_MAX_H = 60          # px: a single-line text field this tall or less is a lock target
 NEAR_RADIUS = 400         # px: the recorded nearby controls reach past the aim's p90 miss (357 px, live 2026-09-30)
-NEAR_MAX = 8              # controls per recorded snapshot, nearest first
+NEAR_MAX = 24             # controls per recorded snapshot, nearest first (Logic packs ~8 per track header: with 8
+                          # recorded, a 150 px miss left the target out two times in three, tools/intent_eval.py)
 SNAP_MAX_PX = 90          # a control no bigger than this (both ways) snaps the cursor to its centre
 STICKY_PX = 25            # a highlighted control stays the target this far beyond its zone
 READ_FAILS_REOPEN = 30    # consecutive failed camera reads before the camera is closed and opened again
