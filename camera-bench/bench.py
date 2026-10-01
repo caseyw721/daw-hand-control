@@ -1499,6 +1499,67 @@ class Cursor:
         self.Q.CGWarpMouseCursorPosition((x, y))
         self.Q.CGAssociateMouseAndMouseCursorPosition(True)
 
+    def where(self):
+        """The cursor's current position."""
+        if not self.Q:
+            return (0.0, 0.0)
+        loc = self.Q.CGEventGetLocation(self.Q.CGEventCreate(None))
+        return (float(loc.x), float(loc.y))
+
+    def scroll(self, dx, dy):
+        """A scroll-wheel event where the cursor is: dy > 0 scrolls the content down (like rolling the wheel
+        towards you), dx > 0 scrolls it right; units are lines."""
+        if not self.enabled:
+            return
+        Q = self.Q
+        ev = Q.CGEventCreateScrollWheelEvent(None, Q.kCGScrollEventUnitLine, 2, int(-dy), int(-dx))
+        Q.CGEventPost(Q.kCGHIDEventTap, ev)
+
+
+def press_at(probe, cursor, x, y):
+    """Activates the control at (x, y), for a spoken "open this"/"mute this" resolved to a control: AXPress when
+    Accessibility offers it (nothing moves on screen), else a click there with the cursor put back where it was.
+    Returns what happened."""
+    if probe is not None and probe.ok:
+        try:
+            err, el = probe.AS.AXUIElementCopyElementAtPosition(probe.sys, x, y, None)
+            if err == 0 and el is not None:
+                err2, acts = probe.AS.AXUIElementCopyActionNames(el, None)
+                if err2 == 0 and acts and "AXPress" in set(acts):
+                    probe.AS.AXUIElementPerformAction(el, "AXPress")
+                    return "AXPress " + (probe._label(el) or str(probe._attr(el, "AXRole") or ""))[:30]
+        except Exception as e:                      # fall back to a real click
+            print(f"I,press,ax-failed,{e}", file=sys.stderr, flush=True)
+    here = cursor.where()
+    cursor.press(x, y)
+    cursor.release(x, y)
+    cursor.warp(*here)
+    return "click"
+
+
+def close_window(probe, name):
+    """Closes the front app's window whose title, or a top-level group inside it, contains `name` (a plug-in window
+    in Logic is titled by its track, its plug-in's name is the group inside). Never the project window. Returns
+    the title closed, or None."""
+    import AppKit
+    front = AppKit.NSWorkspace.sharedWorkspace().frontmostApplication()
+    if front is None or probe is None or not probe.ok:
+        return None
+    AS = probe.AS
+    app = AS.AXUIElementCreateApplication(front.processIdentifier())
+    want = name.strip().lower()
+    for win in probe._attr(app, "AXWindows") or []:
+        title = str(probe._attr(win, "AXTitle") or "")
+        if ".logicx" in title.lower():
+            continue
+        names = [title] + [probe._label(k) for k in (probe._attr(win, "AXChildren") or [])[:40]]
+        if any(want in (n or "").lower() for n in names):
+            btn = probe._attr(win, "AXCloseButton")
+            if btn is not None:
+                AS.AXUIElementPerformAction(btn, "AXPress")
+                return title or name
+    return None
+
 
 DRAG_ROLES = {"AXSlider", "AXIncrementor", "AXValueIndicator", "AXLevelIndicator",
               "AXHandle", "AXLayoutItem"}   # the last two only as classify admits them: Logic's cycle area and locators
@@ -2020,6 +2081,33 @@ def main():
                     elif parts[:1] == ["key"] and len(parts) == 2:
                         if not cursor.key(parts[1]):
                             raise ValueError(f"unknown key or hands off: {parts[1]}")
+                    elif parts[:1] == ["press"] and len(parts) == 3:
+                        # a spoken command resolved to a control (the intent model): activate it where it is
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        what = press_at(probe, cursor, float(parts[1]), float(parts[2]))
+                        print(f"I,press,{float(parts[1]):.0f},{float(parts[2]):.0f},{what}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["hold"] and len(parts) in (3, 4):
+                        # "grab this" by voice: a grab session at this point, dragged by the hand until `release`
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        nonlocal_state["hold"] = {"x": float(parts[1]), "y": float(parts[2]),
+                                                  "role": parts[3] if len(parts) == 4 else "AXSlider", "begun": False}
+                        print(f"I,hold,{float(parts[1]):.0f},{float(parts[2]):.0f}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["release"] and len(parts) == 1:
+                        nonlocal_state["release"] = True
+                    elif parts[:1] == ["scroll"] and len(parts) == 3:
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        cursor.scroll(float(parts[1]), float(parts[2]))
+                        print(f"I,scroll,{parts[1]},{parts[2]}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["closewin"] and len(parts) >= 2:
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        closed = close_window(probe, " ".join(parts[1:]))
+                        if closed is None:
+                            raise ValueError(f"no window named {' '.join(parts[1:])!r}")
+                        print(f"I,closewin,{closed}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["type"] and len(parts) >= 2:
                         cursor.type(raw.strip()[5:])
                     elif parts[:1] == ["tap"] and len(parts) == 2 and parts[1] in ("on", "off"):
@@ -2331,6 +2419,14 @@ def main():
                             tap = {"t": t_det, "grabbed": False}
                     thumb_mode = isinstance(mapper, AimMap) and args.trigger == "thumb"
                     held = thumb.closed if thumb_mode else (pinch.closed or (args.grip == "on" and grip.closed))
+                    vhold = nonlocal_state.get("hold")
+                    if nonlocal_state.pop("release", False) or (vhold is not None and not cursor.enabled):
+                        vhold = nonlocal_state["hold"] = None     # "let go", or hands went off
+                    if vhold is not None:
+                        held = True                               # the voice holds the grab until "release"
+                        if not vhold["begun"]:
+                            vhold["begun"] = True
+                            pos = (vhold["x"], vhold["y"])
                     held_down = held and not held_was
                     held_was = held
                     if 0 < raw[0] < sw - 1 and 0 < raw[1] < sh - 1:  # clamped at an edge is not "still"
@@ -2340,7 +2436,9 @@ def main():
                     # Heisenberg: the pinch itself nudges the finger; use the position from before it.
                     tb = t_det - args.heisenberg_ms / 1000
                     click_at = next(((x, y) for (t, x, y) in history if t >= tb), pos)
-                    if held_down and isinstance(mapper, AimMap):
+                    if vhold is not None and held_down:
+                        click_at = pos                            # exactly the resolved control, no rewind
+                    elif held_down and isinstance(mapper, AimMap):
                         # the pinch moved the fingertip and the aim with it: grab where the cursor was before it began
                         rw = rewind_point(history, hand_hist, t_det, what="thumb" if thumb_mode else (
                             "grip" if (not pinch.closed and args.grip == "on" and grip.closed) else "pinch"),
@@ -2380,6 +2478,8 @@ def main():
                     if grab.mode != "off" and (cursor.enabled or grab.at is not None):   # no grabs while hands are off
                         if held_down and cursor.enabled:
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
+                            if vhold is not None:
+                                role = vhold["role"]
                             grab.begin(pos, t_det, free, role)
                         if held and grab.at is not None:
                             a = grab.step(t_det, free)
@@ -2395,6 +2495,7 @@ def main():
                                 cursor.drag(a[1], a[2], a[3], a[4])
                         elif grab.at is not None and not held:
                             r = grab.end()
+                            nonlocal_state["hold"] = None
                             if r:
                                 cursor.release(r[1], r[2])
                                 cursor.warp(r[3], r[4])

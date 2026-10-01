@@ -385,6 +385,20 @@ check(bare.verify((10, 10)) == (True, "no Accessibility"), "without Accessibilit
 bare.near_on = False
 bare.start_near()
 check(not bare.near_on, "without Accessibility no nearby-controls thread starts")
+# --- acting on a resolved control: without Accessibility a press is a click put back where the cursor was
+from bench import Cursor, close_window, press_at  # noqa: E402
+class FakeCursor(Cursor):
+    def __init__(self):
+        self.enabled, self.down, self.Q, self.log = True, False, None, []
+    def where(self): return (5.0, 6.0)
+    def press(self, x, y): self.log.append(("press", x, y))
+    def release(self, x, y): self.log.append(("release", x, y))
+    def warp(self, x, y): self.log.append(("warp", x, y))
+fc = FakeCursor()
+check(press_at(bare, fc, 100, 200) == "click" and fc.log == [("press", 100, 200), ("release", 100, 200), ("warp", 5.0, 6.0)],
+      f"press_at without Accessibility clicks and puts the cursor back ({fc.log})")
+check(close_window(bare, "sublab") is None, "close_window without Accessibility closes nothing")
+Cursor(enabled=False).scroll(0, 3)   # disabled: a no-op
 # --- the recorded nearby controls: within the radius, nearest first, each once ---
 from bench import rank_near  # noqa: E402
 ctl = [("AXSlider", (100, 100, 20, 180), "volume"), ("AXSlider", (100.2, 100, 20, 180), "volume"),
