@@ -2708,13 +2708,9 @@ def main():
                             cursor.key("p")
                         print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["wheel"] and len(parts) == 2 and parts[1] in ("on", "off", "flip"):
-                        if wheel is None:
-                            raise ValueError("no wheel (started with --wheel 0 or without --ring)")
-                        if parts[1] == "flip":
-                            wheel.sign = -wheel.sign
-                        else:
-                            wheel.enabled = parts[1] == "on"
-                        print(f"I,wheel,{parts[1]}", file=sys.stderr, flush=True)
+                        if not args.wheel:
+                            raise ValueError("no wheel (started with --wheel 0)")
+                        nonlocal_state["wheel_cmd"] = parts[1]     # applied on the main thread, after the ring's overlay exists
                     elif parts[:1] == ["front"] and len(parts) >= 2:
                         if not cursor.enabled:
                             raise ValueError("hands off")
@@ -2930,6 +2926,19 @@ def main():
                 if ring is not None:                 # AppKit windows are made and closed on this (the main) thread
                     overlay.close()
                     overlay = Overlay(size=ring or 64, enabled=bool(ring))
+                    if args.wheel and ring:          # the flywheel lives in the overlay: made with it
+                        wheel = Wheel(args.wheel, sw, sh, sign=wheel.sign if wheel is not None else 1.0)
+                        overlay.wheel_setup(wheel.rect)
+                        print(f"I,wheel,{wheel.size}px at {wheel.rect[0]:.0f},{wheel.rect[1]:.0f}", file=sys.stderr, flush=True)
+                    else:
+                        wheel = None
+                cmd = nonlocal_state.pop("wheel_cmd", None)
+                if cmd and wheel is not None:
+                    if cmd == "flip":
+                        wheel.sign = -wheel.sign
+                    else:
+                        wheel.enabled = cmd == "on"
+                    print(f"I,wheel,{cmd}", file=sys.stderr, flush=True)
                 if nonlocal_state.pop("recenter", None) and isinstance(mapper, MetricMap):
                     mapper.recenter_next = True
                     lock.reset()
