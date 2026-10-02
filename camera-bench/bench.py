@@ -2019,76 +2019,122 @@ class Grab:
         return r
 
 
-WHEEL_DETENT_DEG = 12.0      # one notch of the flywheel: one scroll step and one click
+WHEEL_DETENT_DEG = 12.0      # flywheel mode: one notch = one scroll step and one click
 WHEEL_LINES = 3              # scroll lines per notch (Logic's timeline: ~72 lines per turn)
-WHEEL_TAU = 0.9              # after letting go the wheel spins down with this e-folding time (s)
+WHEEL_TAU = 0.9              # flywheel mode: after letting go the wheel spins down with this e-folding time (s)
 WHEEL_STOP_DPS = 25.0        # and stops below this speed (deg/s)
 WHEEL_MIN_TICK_S = 0.03      # clicks no closer than this
+BENDER_DEAD_DEG = 4.0        # spring mode: twist within this of centre does nothing
+BENDER_MAX_DEG = 80.0        # full deflection
+BENDER_MAX_LPS = 90.0        # scroll lines per second at full deflection (a quadratic curve: small twists crawl)
+BENDER_TICK_LINES = 2.0      # a click every this many lines, so the click rate follows the speed
+BENDER_RETURN_S = 0.25       # the spokes swing back to centre over this after letting go
 
 
 class Wheel:
-    """The scroll flywheel (user, 2026-10-01): a big orange disc in the top-right corner of the screen. Pinch and hold
-    on it, then twist the wrist like a knob: every WHEEL_DETENT_DEG of roll scrolls the DAW one step and clicks; let
-    go with some speed and it keeps spinning down, still scrolling. The scroll goes to `anchor`, where the cursor
-    last was in the DAW (the mouse is warped there when the wheel is taken), not to the wheel. Replaces circling the
-    finger in the air, which ran the cursor over controls that snapped and selected."""
+    """The scroll wheel (user, 2026-10-01): a big orange disc in the top-right corner of the screen. Pinch and hold
+    on it, then twist the wrist like a knob. Two feels:
+      bender (default): a spring. The twist from where you took it is a scroll *speed*, left or right, with a
+        dead zone at centre and a quadratic curve (a small twist crawls for fine moves, a big one flies through the
+        track); let go and it snaps back and stops. Clicks come at the scroll rate, like a flywheel's ratchet.
+        (user: "like a pitch bender, as if it has a spring inside"; the flywheel's let-go was never smooth because
+        the camera sees the pinch open a few frames late and jittery)
+      fly: notches. Every WHEEL_DETENT_DEG of roll scrolls WHEEL_LINES and clicks; let go with speed and it spins down.
+    The scroll goes to `target`: the centre of Logic's Tracks area when Accessibility can see it, else where the
+    cursor last was well clear of the wheel (the mouse is warped there when the wheel is taken)."""
 
-    def __init__(self, size, sw, sh, margin=28, top=58, sign=1.0):
+    def __init__(self, size, sw, sh, margin=28, top=58, sign=1.0, mode="bender"):
         self.size = size
         self.rect = (sw - size - margin, top, size, size)
         self.cx, self.cy = self.rect[0] + size / 2, self.rect[1] + size / 2
         self.enabled = True
+        self.mode = mode
         self.sign = sign                 # +1: a clockwise twist scrolls right; `wheel flip` turns it round
-        self.angle = 0.0
+        self.angle = 0.0                 # what the spokes show (deg, clockwise)
         self.active = False
-        self.v = 0.0                     # deg/s, clockwise positive
-        self.r_prev = self.t_prev = None
-        self.pending = 0.0
+        self.v = 0.0                     # fly: deg/s; bender: lines/s
+        self.r_prev = self.t_prev = self.r0 = None
+        self.pending = 0.0               # fly: degrees towards the next notch; bender: lines towards the next scroll
+        self.since_tick = 0.0            # bender: lines since the last click
         self.anchor = None
+        self.target = None
         self.last_tick = 0.0
         self.turned = 0.0                # degrees in this grab (for the log)
+        self.scrolled = 0                # lines in this grab (for the log)
         self.sound = self._click()
 
     def contains(self, pos, zone=24.0):
         return self.enabled and pos is not None and math.hypot(pos[0] - self.cx, pos[1] - self.cy) <= self.size / 2 + zone
 
     def grab(self, t, roll):
-        self.active, self.r_prev, self.t_prev, self.v, self.turned = True, roll, t, 0.0, 0.0
+        self.active, self.r_prev, self.r0, self.t_prev = True, roll, roll, t
+        self.v, self.turned, self.scrolled, self.pending, self.since_tick = 0.0, 0.0, 0, 0.0, 0.0
 
     def step(self, t, roll):
-        """Notches turned this frame while held (signed)."""
+        """(lines to scroll this frame, click?) while held."""
         if roll is None or self.r_prev is None:
             self.r_prev, self.t_prev = roll, t
-            return 0
-        d = (self.r_prev - roll) * self.sign           # the camera mirrors the hand: clockwise for the user = the roll falling
+            if self.r0 is None:
+                self.r0 = roll
+            return 0, False
         dt = max(t - (self.t_prev if self.t_prev is not None else t), 1e-3)
+        d = (self.r_prev - roll) * self.sign           # the camera mirrors the hand: clockwise for the user = the roll falling
         self.r_prev, self.t_prev = roll, t
-        self.v = 0.6 * self.v + 0.4 * (d / dt)
         self.turned += d
-        return self._turn(d)
+        if self.mode == "fly":
+            self.v = 0.6 * self.v + 0.4 * (d / dt)
+            n = self._notch(d)
+            self.scrolled += n * WHEEL_LINES
+            return n * WHEEL_LINES, n != 0
+        # bender: deflection -> speed
+        defl = max(-BENDER_MAX_DEG, min(BENDER_MAX_DEG, (self.r0 - roll) * self.sign))
+        self.angle = defl
+        mag = max(0.0, abs(defl) - BENDER_DEAD_DEG) / (BENDER_MAX_DEG - BENDER_DEAD_DEG)
+        self.v = math.copysign(BENDER_MAX_LPS * mag * mag, defl) if mag > 0 else 0.0
+        self.pending += self.v * dt
+        n = int(self.pending)
+        if n:
+            self.pending -= n
+            self.scrolled += n
+            self.since_tick += abs(n)
+        tick = self.since_tick >= BENDER_TICK_LINES
+        if tick:
+            self.since_tick = 0.0
+        return n, tick
 
     def release(self, t):
         self.active, self.r_prev, self.t_prev = False, None, t
-        if abs(self.v) < WHEEL_STOP_DPS:
-            self.v = 0.0
+        if self.mode == "fly":
+            if abs(self.v) < WHEEL_STOP_DPS:
+                self.v = 0.0
+        else:
+            self.v = 0.0                             # the spring: letting go stops the scroll at once
 
     def coast(self, t):
-        """Notches turned this frame by the flywheel after a release (signed)."""
-        if self.active or self.v == 0.0:
-            return 0
+        """(lines, click?) after a release: the flywheel spinning down, or the spring swinging the spokes back."""
         dt = max(t - (self.t_prev if self.t_prev is not None else t), 1e-3)
         self.t_prev = t
+        if self.active:
+            return 0, False
+        if self.mode != "fly":
+            if self.angle:
+                k = min(1.0, dt / BENDER_RETURN_S)
+                self.angle = 0.0 if abs(self.angle) < 0.5 else self.angle * (1.0 - k)
+            return 0, False
+        if self.v == 0.0:
+            return 0, False
         d = self.v * dt
         self.v *= math.exp(-dt / WHEEL_TAU)
         if abs(self.v) < WHEEL_STOP_DPS:
             self.v = 0.0
-        return self._turn(d)
+        n = self._notch(d)
+        return n * WHEEL_LINES, n != 0
 
     @property
     def spinning(self):
         return self.active or self.v != 0.0
 
-    def _turn(self, d):
+    def _notch(self, d):
         self.angle = (self.angle + d) % 360.0
         self.pending += d
         n = int(self.pending / WHEEL_DETENT_DEG)
@@ -2139,6 +2185,27 @@ class Wheel:
         except Exception as e:
             print(f"I,wheel,no-click,{e}", file=sys.stderr, flush=True)
             return None
+
+
+def tracks_centre(probe):
+    """The centre of Logic's Tracks area in the project window (the largest group called "Tracks"), or None: where
+    the wheel's scrolling is sent, so it moves the timeline wherever the hand happens to be."""
+    if probe is None or not probe.ok:
+        return None
+    best = None
+    for win in _logic_project_windows(probe):
+        stack = [(win, 0)]
+        while stack:
+            el, d = stack.pop()
+            if probe._label(el) == "Tracks":
+                f = probe._frame(el)
+                if f and (best is None or f[2] * f[3] > best[2] * best[3]):
+                    best = f
+            if d < 3:
+                stack.extend((k, d + 1) for k in (probe._attr(el, "AXChildren") or []))
+    if best is None:
+        return None
+    return (best[0] + best[2] / 2, best[1] + min(best[3] / 2, 300))
 
 
 class Sound:
@@ -2707,7 +2774,7 @@ def main():
                         elif showing is None:
                             cursor.key("p")
                         print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
-                    elif parts[:1] == ["wheel"] and len(parts) == 2 and parts[1] in ("on", "off", "flip"):
+                    elif parts[:1] == ["wheel"] and len(parts) == 2 and parts[1] in ("on", "off", "flip", "bender", "fly"):
                         if not args.wheel:
                             raise ValueError("no wheel (started with --wheel 0)")
                         nonlocal_state["wheel_cmd"] = parts[1]     # applied on the main thread, after the ring's overlay exists
@@ -2927,7 +2994,7 @@ def main():
                     overlay.close()
                     overlay = Overlay(size=ring or 64, enabled=bool(ring))
                     if args.wheel and ring:          # the flywheel lives in the overlay: made with it
-                        wheel = Wheel(args.wheel, sw, sh, sign=wheel.sign if wheel is not None else 1.0)
+                        wheel = Wheel(args.wheel, sw, sh, sign=wheel.sign if wheel is not None else 1.0, mode=wheel.mode if wheel is not None else "bender")
                         overlay.wheel_setup(wheel.rect)
                         print(f"I,wheel,{wheel.size}px at {wheel.rect[0]:.0f},{wheel.rect[1]:.0f}", file=sys.stderr, flush=True)
                     else:
@@ -2936,6 +3003,8 @@ def main():
                 if cmd and wheel is not None:
                     if cmd == "flip":
                         wheel.sign = -wheel.sign
+                    elif cmd in ("bender", "fly"):
+                        wheel.mode = cmd
                     else:
                         wheel.enabled = cmd == "on"
                     print(f"I,wheel,{cmd}", file=sys.stderr, flush=True)
@@ -3139,21 +3208,24 @@ def main():
                         if cursor.enabled and not wheel.active and not grab.active and on_screen and not wheel.contains(pos, zone=wheel.size):
                             wheel.anchor = pos                     # where the scrolling goes: the cursor's last place in the DAW,
                                                                    # well clear of the wheel (the hand passes its edge on the way in)
-                        notches = 0
+                        lines, click = 0, False
                         if held_down and cursor.enabled and not grab.active and wheel.contains(pos):
                             wheel.grab(t_det, nonlocal_state.get("roll"))
-                            if wheel.anchor is not None:
-                                cursor.warp(*wheel.anchor)
-                            print(f"I,wheel,grab,anchor,{(wheel.anchor or (0, 0))[0]:.0f},{(wheel.anchor or (0, 0))[1]:.0f}", file=sys.stderr, flush=True)
+                            wheel.target = tracks_centre(probe) or wheel.anchor
+                            if wheel.target is not None:
+                                cursor.warp(*wheel.target)
+                            tx, ty = wheel.target or (0, 0)
+                            print(f"I,wheel,grab,{wheel.mode},at,{tx:.0f},{ty:.0f}", file=sys.stderr, flush=True)
                         elif wheel.active and held:
-                            notches = wheel.step(t_det, nonlocal_state.get("roll"))
+                            lines, click = wheel.step(t_det, nonlocal_state.get("roll"))
                         elif wheel.active and not held:
                             wheel.release(t_det)
-                            print(f"I,wheel,release,{wheel.turned:+.0f}deg,{wheel.v:+.0f}dps", file=sys.stderr, flush=True)
+                            print(f"I,wheel,release,{wheel.turned:+.0f}deg,{wheel.scrolled:+d}lines", file=sys.stderr, flush=True)
                         else:
-                            notches = wheel.coast(t_det)
-                        if notches:
-                            cursor.scroll(notches * WHEEL_LINES, 0)
+                            lines, click = wheel.coast(t_det)
+                        if lines:
+                            cursor.scroll(lines, 0)
+                        if click:
                             wheel.tick(t_det)
                         if wheel.active and tap is not None:
                             tap["grabbed"] = True                  # a pinch on the wheel never clicks
