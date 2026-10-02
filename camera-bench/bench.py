@@ -211,6 +211,8 @@ class Nudge:
         return aim
 
 
+TWIST_PX_PER_DEG = 3.0       # a grab turns with the wrist: px of vertical drag per degree of roll (90 deg = a full fader)
+TWIST_DEADBAND_DEG = 3.0     # wrist roll below this during a grab is noise
 GRAB_MINCUTOFF, GRAB_BETA = 0.4, 0.004   # 1-euro filter on the drag source: steady at rest, still follows a deliberate move
 GRAB_HAND_PX = 1.5           # aim-mode drags: screen px per camera px of the hand's base (x grab gain); ~6 cm = a fader
 TAP_S = 0.4                  # the finger gun: a trigger press shorter than this that did not grab is a click
@@ -1967,27 +1969,35 @@ class Grab:
         self.at = self.t0 = self.h0 = None
         self.active = self.allowed = False
         self.dx = self.dy = 0.0
+        self.r0 = None                               # the wrist roll (deg) when the press happened
 
     @staticmethod
     def _xy(hand):
         return (0.0, float(hand)) if not isinstance(hand, (tuple, list)) else (float(hand[0]), float(hand[1]))
 
-    def begin(self, at, t, hand, role):
+    def begin(self, at, t, hand, role, roll=None):
         self.reset()
-        self.at, self.t0, self.h0 = at, t, self._xy(hand)
+        self.at, self.t0, self.h0, self.r0 = at, t, self._xy(hand), roll
         self.allowed = self.mode == "any" or (self.mode == "drag" and role in DRAG_ROLES)
 
-    def step(self, t, hand):
-        """('press', x, y) once the hold has lasted, then ('drag', x, y, ddx, ddy) as the hand moves; else None."""
+    def step(self, t, hand, roll=None):
+        """('press', x, y) once the hold has lasted, then ('drag', x, y, ddx, ddy) as the hand moves or the wrist
+        twists (`roll`, unwrapped degrees: TWIST_PX_PER_DEG of vertical drag per degree, so a knob turns like a knob;
+        user, live 2026-10-01: "it's not natural to lift my hand up and down to raise the fader ... twist like this");
+        else None."""
         if self.at is None or not self.allowed:
             return None
         hx, hy = self._xy(hand)
         if not self.active:
             if t - self.t0 >= self.hold_s:
-                self.active, self.h0, self.dx, self.dy = True, (hx, hy), 0.0, 0.0
+                self.active, self.h0, self.dx, self.dy, self.r0 = True, (hx, hy), 0.0, 0.0, roll
                 return ("press", self.at[0], self.at[1])
             return None
         dx, dy = (hx - self.h0[0]) * self.gain, (hy - self.h0[1]) * self.gain
+        if roll is not None and self.r0 is not None:
+            turn = roll - self.r0
+            if abs(turn) > TWIST_DEADBAND_DEG:
+                dy += (turn - math.copysign(TWIST_DEADBAND_DEG, turn)) * TWIST_PX_PER_DEG
         ddx, ddy = dx - self.dx, dy - self.dy
         if abs(ddx) < 0.5 and abs(ddy) < 0.5:
             return None
@@ -2898,6 +2908,18 @@ def main():
                         free = (gx(-bx * cw * GRAB_HAND_PX, t_det), gy(by * ch * GRAB_HAND_PX, t_det))
                     else:
                         free = pos
+                    # the wrist's roll (the knuckle line, index MCP -> pinky MCP), unwrapped across frames, for the grab's twist
+                    try:
+                        raw_roll = math.degrees(math.atan2((lm[17][1] - lm[5][1]) * ch, (lm[17][0] - lm[5][0]) * cw))
+                        prev = nonlocal_state.get("roll_raw")
+                        if prev is None:
+                            nonlocal_state["roll"] = 0.0
+                        else:
+                            d = (raw_roll - prev + 180.0) % 360.0 - 180.0
+                            nonlocal_state["roll"] = nonlocal_state.get("roll", 0.0) + d
+                        nonlocal_state["roll_raw"] = raw_roll
+                    except Exception:
+                        pass
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
                                       grab_at=click_at if held_down else None, target=target)
                     if probe and not grab.active:
@@ -2909,9 +2931,9 @@ def main():
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
                             if vhold is not None:
                                 role = vhold["role"]
-                            grab.begin(pos, t_det, free, role)
+                            grab.begin(pos, t_det, free, role, roll=nonlocal_state.get("roll"))
                         if held and grab.at is not None:
-                            a = grab.step(t_det, free)
+                            a = grab.step(t_det, free, roll=nonlocal_state.get("roll"))
                             if a and a[0] == "press":
                                 ok_here, what = probe.verify((a[1], a[2])) if (probe and grab.mode == "drag") else (True, "")
                                 if not (0 <= a[1] < sw and 0 <= a[2] < sh):
