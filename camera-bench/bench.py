@@ -1842,6 +1842,61 @@ def open_slot(probe, name):
     return None
 
 
+def bring_front(probe, what, pos):
+    """Brings a window to the front: `here` = the window under the cursor; a name = the app called that (Splice,
+    Logic) or the window titled that, or a plug-in window by the plug-in's name (the group inside it). Activates
+    the app and raises the window. Returns what came up, or None. (user, 2026-10-01: Splice, the SubLab GUI and
+    Logic stacked up behind the preview: "quickly click on those and have them come to the front")"""
+    import AppKit
+    import ApplicationServices as AS
+    ws = AppKit.NSWorkspace.sharedWorkspace()
+
+    def raise_window(win, pid):
+        app = AppKit.NSRunningApplication.runningApplicationWithProcessIdentifier_(pid)
+        if app is not None:
+            app.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
+        AS.AXUIElementPerformAction(win, "AXRaise")
+        err, title = AS.AXUIElementCopyAttributeValue(win, "AXTitle", None)
+        return str(title or "") if err == 0 else ""
+
+    if what == "here":
+        err, el = AS.AXUIElementCopyElementAtPosition(AS.AXUIElementCreateSystemWide(), pos[0], pos[1], None)
+        node = el if err == 0 else None
+        for _ in range(16):
+            if node is None:
+                return None
+            err, role = AS.AXUIElementCopyAttributeValue(node, "AXRole", None)
+            if err == 0 and str(role) == "AXWindow":
+                err, pid = AS.AXUIElementGetPid(node, None)
+                return raise_window(node, pid) or "window"
+            err, node = AS.AXUIElementCopyAttributeValue(node, "AXParent", None)
+            if err != 0:
+                return None
+        return None
+    want = re.sub(r"[^a-z0-9]", "", what.lower())
+    if not want:
+        return None
+    apps = [a for a in ws.runningApplications() if a.activationPolicy() == 0]
+    for a in apps:                                   # an app by name: Splice, Logic Pro
+        if want in re.sub(r"[^a-z0-9]", "", str(a.localizedName() or "").lower()):
+            a.activateWithOptions_(AppKit.NSApplicationActivateIgnoringOtherApps)
+            return str(a.localizedName())
+    for a in apps:                                   # a window by title, or a plug-in window by the plug-in inside it
+        ax = AS.AXUIElementCreateApplication(a.processIdentifier())
+        err, wins = AS.AXUIElementCopyAttributeValue(ax, "AXWindows", None)
+        for win in (wins or []) if err == 0 else []:
+            err, title = AS.AXUIElementCopyAttributeValue(win, "AXTitle", None)
+            names = [str(title or "")]
+            err, kids = AS.AXUIElementCopyAttributeValue(win, "AXChildren", None)
+            for k in (kids or [])[:40] if err == 0 else []:
+                e2, d = AS.AXUIElementCopyAttributeValue(k, "AXDescription", None)
+                e3, t2 = AS.AXUIElementCopyAttributeValue(k, "AXTitle", None)
+                names.append(str((d if e2 == 0 and d else None) or (t2 if e3 == 0 else "") or ""))
+            if any(want in re.sub(r"[^a-z0-9]", "", n.lower()) for n in names if n):
+                return raise_window(win, a.processIdentifier()) or str(a.localizedName())
+    return None
+
+
 def select_track(probe, cursor, n, tries=8):
     """Selects track n in Logic's Tracks window: presses its header's focus strip (or clicks its lane), scrolling the
     track list first when n is out of view (the adapter only knows the eight names of the current bank).
@@ -2451,6 +2506,14 @@ def main():
                         elif showing is None:
                             cursor.key("p")
                         print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["front"] and len(parts) >= 2:
+                        if not cursor.enabled:
+                            raise ValueError("hands off")
+                        what = " ".join(parts[1:])
+                        up = bring_front(probe, what, lock.at if lock.at is not None else cursor.where())
+                        if up is None:
+                            raise ValueError(f"nothing called {what!r} to bring to the front")
+                        print(f"I,front,{up}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["openslot"] and len(parts) >= 2:
                         if not cursor.enabled:
                             raise ValueError("hands off")
@@ -2872,12 +2935,13 @@ def main():
                                 print(f"I,grab,release,{r[2] - r[4]:+.0f}px,{r[1] - r[3]:+.0f}px across", file=sys.stderr, flush=True)
                     if tap is not None and grab.active:
                         tap["grabbed"] = True
-                    if tevent == "up" and tap is not None:
-                        # the finger gun fires: a quick tap that did not become a grab clicks where the cursor is held
-                        # (user, live, trying to open Logic from the Dock with the trigger)
+                    if ((tevent == "up") if thumb_mode else (event == "up")) and tap is not None:
+                        # the finger gun fires, or a quick pinch opens and closes: a tap that did not become a grab
+                        # clicks where the cursor was held, or where the pinch began (user, live 2026-10-01: "quickly
+                        # click on those windows and have them come to the front")
                         quick = t_det - tap["t"] <= TAP_S
-                        if quick and not tap["grabbed"] and args.tap == "on" and cursor.enabled and thumb_mode:
-                            at = lock.at if lock.at is not None else pos
+                        if quick and not tap["grabbed"] and args.tap == "on" and cursor.enabled:
+                            at = lock.at if lock.at is not None else tap.get("at") or pos
                             if 0 <= at[0] < sw and 0 <= at[1] < sh:
                                 cursor.press(*at)
                                 cursor.release(*at)
@@ -2888,6 +2952,8 @@ def main():
                         tap = None
                     if event == "down":
                         click_at = pos
+                        if not thumb_mode:            # a pinch starts a tap: quick = click, held = grab (tap on)
+                            tap = {"t": t_det, "grabbed": False, "at": click_at}
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
                         if not thumb_mode:            # with the finger gun, only the trigger sounds
                             sound.play("Tink")
