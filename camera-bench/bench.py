@@ -2019,6 +2019,128 @@ class Grab:
         return r
 
 
+WHEEL_DETENT_DEG = 12.0      # one notch of the flywheel: one scroll step and one click
+WHEEL_LINES = 3              # scroll lines per notch (Logic's timeline: ~72 lines per turn)
+WHEEL_TAU = 0.9              # after letting go the wheel spins down with this e-folding time (s)
+WHEEL_STOP_DPS = 25.0        # and stops below this speed (deg/s)
+WHEEL_MIN_TICK_S = 0.03      # clicks no closer than this
+
+
+class Wheel:
+    """The scroll flywheel (user, 2026-10-01): a big orange disc in the top-right corner of the screen. Pinch and hold
+    on it, then twist the wrist like a knob: every WHEEL_DETENT_DEG of roll scrolls the DAW one step and clicks; let
+    go with some speed and it keeps spinning down, still scrolling. The scroll goes to `anchor`, where the cursor
+    last was in the DAW (the mouse is warped there when the wheel is taken), not to the wheel. Replaces circling the
+    finger in the air, which ran the cursor over controls that snapped and selected."""
+
+    def __init__(self, size, sw, sh, margin=28, top=58, sign=1.0):
+        self.size = size
+        self.rect = (sw - size - margin, top, size, size)
+        self.cx, self.cy = self.rect[0] + size / 2, self.rect[1] + size / 2
+        self.enabled = True
+        self.sign = sign                 # +1: a clockwise twist scrolls right; `wheel flip` turns it round
+        self.angle = 0.0
+        self.active = False
+        self.v = 0.0                     # deg/s, clockwise positive
+        self.r_prev = self.t_prev = None
+        self.pending = 0.0
+        self.anchor = None
+        self.last_tick = 0.0
+        self.turned = 0.0                # degrees in this grab (for the log)
+        self.sound = self._click()
+
+    def contains(self, pos, zone=24.0):
+        return self.enabled and pos is not None and math.hypot(pos[0] - self.cx, pos[1] - self.cy) <= self.size / 2 + zone
+
+    def grab(self, t, roll):
+        self.active, self.r_prev, self.t_prev, self.v, self.turned = True, roll, t, 0.0, 0.0
+
+    def step(self, t, roll):
+        """Notches turned this frame while held (signed)."""
+        if roll is None or self.r_prev is None:
+            self.r_prev, self.t_prev = roll, t
+            return 0
+        d = (self.r_prev - roll) * self.sign           # the camera mirrors the hand: clockwise for the user = the roll falling
+        dt = max(t - (self.t_prev if self.t_prev is not None else t), 1e-3)
+        self.r_prev, self.t_prev = roll, t
+        self.v = 0.6 * self.v + 0.4 * (d / dt)
+        self.turned += d
+        return self._turn(d)
+
+    def release(self, t):
+        self.active, self.r_prev, self.t_prev = False, None, t
+        if abs(self.v) < WHEEL_STOP_DPS:
+            self.v = 0.0
+
+    def coast(self, t):
+        """Notches turned this frame by the flywheel after a release (signed)."""
+        if self.active or self.v == 0.0:
+            return 0
+        dt = max(t - (self.t_prev if self.t_prev is not None else t), 1e-3)
+        self.t_prev = t
+        d = self.v * dt
+        self.v *= math.exp(-dt / WHEEL_TAU)
+        if abs(self.v) < WHEEL_STOP_DPS:
+            self.v = 0.0
+        return self._turn(d)
+
+    @property
+    def spinning(self):
+        return self.active or self.v != 0.0
+
+    def _turn(self, d):
+        self.angle = (self.angle + d) % 360.0
+        self.pending += d
+        n = int(self.pending / WHEEL_DETENT_DEG)
+        if n:
+            self.pending -= n * WHEEL_DETENT_DEG
+        return n
+
+    def tick(self, t):
+        if self.sound is None or t - self.last_tick < WHEEL_MIN_TICK_S:
+            return
+        self.last_tick = t
+        try:
+            if self.sound.isPlaying():
+                self.sound.stop()
+            self.sound.play()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _click():
+        """A short mechanical click (6 ms of decaying noise with a 2 kHz edge), written once, played by NSSound."""
+        try:
+            import random
+            import struct
+            import wave
+            import AppKit
+            d = os.path.expanduser("~/Library/Application Support/DAW Control")
+            os.makedirs(d, exist_ok=True)
+            path = os.path.join(d, "wheel-click.wav")
+            if not os.path.exists(path):
+                rate, n = 44100, int(0.006 * 44100)
+                rnd = random.Random(7)
+                frames = bytearray()
+                for i in range(n):
+                    tt = i / rate
+                    env = math.exp(-tt / 0.0012)
+                    v = (0.55 * (rnd.random() * 2 - 1) + 0.45 * math.sin(2 * math.pi * 2000 * tt)) * env
+                    frames += struct.pack("<h", int(max(-1.0, min(1.0, v)) * 22000))
+                with wave.open(path, "wb") as w:
+                    w.setnchannels(1)
+                    w.setsampwidth(2)
+                    w.setframerate(rate)
+                    w.writeframes(bytes(frames))
+            snd = AppKit.NSSound.alloc().initWithContentsOfFile_byReference_(path, True)
+            if snd is not None:
+                snd.setVolume_(0.6)
+            return snd
+        except Exception as e:
+            print(f"I,wheel,no-click,{e}", file=sys.stderr, flush=True)
+            return None
+
+
 class Sound:
     """System sounds as feedback the user can hear without watching the log."""
 
@@ -2089,6 +2211,61 @@ class Overlay:
 
     def _colour(self, rgb, a):
         return self.AK.NSColor.colorWithSRGBRed_green_blue_alpha_(rgb[0], rgb[1], rgb[2], a).CGColor()
+
+    WHEEL = (1.0, 0.58, 0.12)     # orange (user, 2026-10-01: "a nice smooth large orange opaque sort of wheel in the top right")
+
+    def wheel_setup(self, rect):
+        """The flywheel: an orange, half-transparent disc in the top-right corner with spokes that turn with the wrist."""
+        if self.ring is None:
+            return
+        Q = self.Q
+        x, y, w, h = rect
+        centre = (x + w / 2, self.sh - (y + h / 2))
+        disc = Q.CALayer.layer()
+        disc.setBounds_(((0, 0), (w, h)))
+        disc.setCornerRadius_(w / 2)
+        disc.setBorderWidth_(6)
+        disc.setPosition_(centre)
+        spokes = Q.CAShapeLayer.layer()
+        spokes.setBounds_(((0, 0), (w, h)))
+        spokes.setPosition_(centre)
+        path = Q.CGPathCreateMutable()
+        r = w / 2 - 10
+        for k in range(6):
+            a = math.pi * k / 6
+            Q.CGPathMoveToPoint(path, None, w / 2 + r * math.cos(a), h / 2 + r * math.sin(a))
+            Q.CGPathAddLineToPoint(path, None, w / 2 - r * math.cos(a), h / 2 - r * math.sin(a))
+        Q.CGPathAddEllipseInRect(path, None, ((w / 2 - 20, h / 2 - 20), (40, 40)))
+        spokes.setPath_(path)
+        spokes.setFillColor_(self._colour((1.0, 1.0, 1.0), 0.0))
+        spokes.setLineWidth_(5)
+        spokes.setLineCap_("round")
+        root = self.win.contentView().layer()
+        for layer in (disc, spokes):
+            layer.setHidden_(True)
+            root.addSublayer_(layer)
+        self.wheel, self.spokes = disc, spokes
+        self._wheel_last = None
+
+    def wheel_update(self, angle_deg, active, visible):
+        """Turns the spokes to `angle_deg` (clockwise on screen) and brightens the disc while it is held or spinning."""
+        if getattr(self, "wheel", None) is None:
+            return
+        Q = self.Q
+        key = (round(angle_deg, 1), active, visible)
+        if key == self._wheel_last:
+            return
+        self._wheel_last = key
+        Q.CATransaction.begin()
+        Q.CATransaction.setDisableActions_(True)
+        self.wheel.setHidden_(not visible)
+        self.spokes.setHidden_(not visible)
+        if visible:
+            self.wheel.setBackgroundColor_(self._colour(self.WHEEL, 0.78 if active else 0.42))
+            self.wheel.setBorderColor_(self._colour(self.WHEEL, 1.0 if active else 0.75))
+            self.spokes.setStrokeColor_(self._colour((1.0, 0.97, 0.9), 0.95 if active else 0.65))
+            self.spokes.setAffineTransform_(Q.CGAffineTransformMakeRotation(-math.radians(angle_deg)))
+        Q.CATransaction.commit()
 
     def style(self, rgb, fill_alpha):
         key = (rgb, fill_alpha)
@@ -2328,6 +2505,8 @@ def main():
                     help="a closed hand (every finger curled) grabs like a held pinch (user, live: \"just grab it\")")
     ap.add_argument("--zone", type=float, default=0.0,
                     help="px: a control this close to the cursor counts as under it (bigger targets); 0 = only on it")
+    ap.add_argument("--wheel", type=int, default=240, metavar="PX",
+                    help="the scroll flywheel in the top-right corner, this big (0 = none); needs --ring for the overlay")
     ap.add_argument("--ring", type=int, default=0, metavar="PX",
                     help="draw a round cursor of this diameter and light up the control under it (0 = off)")
     ap.add_argument("--camera", type=int, default=0)
@@ -2409,6 +2588,10 @@ def main():
     marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
     overlay = Overlay(size=args.ring or 64, enabled=bool(args.ring))
     sw, sh = cursor.screen()
+    wheel = Wheel(args.wheel, sw, sh) if args.wheel and args.ring else None
+    if wheel is not None:
+        overlay.wheel_setup(wheel.rect)
+        print(f"I,wheel,{wheel.size}px at {wheel.rect[0]:.0f},{wheel.rect[1]:.0f}", file=sys.stderr, flush=True)
     if args.aim_calibrate:
         args.mode = "aim"
     if args.mode == "aim" and not os.path.exists(FACE_MODEL):
@@ -2524,6 +2707,14 @@ def main():
                         elif showing is None:
                             cursor.key("p")
                         print(f"I,editor,{parts[1]},{showing or '-'}", file=sys.stderr, flush=True)
+                    elif parts[:1] == ["wheel"] and len(parts) == 2 and parts[1] in ("on", "off", "flip"):
+                        if wheel is None:
+                            raise ValueError("no wheel (started with --wheel 0 or without --ring)")
+                        if parts[1] == "flip":
+                            wheel.sign = -wheel.sign
+                        else:
+                            wheel.enabled = parts[1] == "on"
+                        print(f"I,wheel,{parts[1]}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["front"] and len(parts) >= 2:
                         if not cursor.enabled:
                             raise ValueError("hands off")
@@ -2933,8 +3124,32 @@ def main():
                     if probe and not grab.active:
                         probe.pos = pos
                     marker.move(*pos)
+                    # the scroll flywheel: a pinch held on the disc takes it, the wrist turns it, letting go spins it down
+                    if wheel is not None:
+                        on_screen = 0 <= pos[0] < sw and 0 <= pos[1] < sh
+                        if cursor.enabled and not wheel.active and not grab.active and on_screen and not wheel.contains(pos):
+                            wheel.anchor = pos                     # where the scrolling goes: the cursor's last place in the DAW
+                        notches = 0
+                        if held_down and cursor.enabled and not grab.active and wheel.contains(pos):
+                            wheel.grab(t_det, nonlocal_state.get("roll"))
+                            if wheel.anchor is not None:
+                                cursor.warp(*wheel.anchor)
+                            print(f"I,wheel,grab,anchor,{(wheel.anchor or (0, 0))[0]:.0f},{(wheel.anchor or (0, 0))[1]:.0f}", file=sys.stderr, flush=True)
+                        elif wheel.active and held:
+                            notches = wheel.step(t_det, nonlocal_state.get("roll"))
+                        elif wheel.active and not held:
+                            wheel.release(t_det)
+                            print(f"I,wheel,release,{wheel.turned:+.0f}deg,{wheel.v:+.0f}dps", file=sys.stderr, flush=True)
+                        else:
+                            notches = wheel.coast(t_det)
+                        if notches:
+                            cursor.scroll(notches * WHEEL_LINES, 0)
+                            wheel.tick(t_det)
+                        if wheel.active and tap is not None:
+                            tap["grabbed"] = True                  # a pinch on the wheel never clicks
+                    wheel_held = wheel is not None and wheel.active
                     # the grab session: pinch-and-hold (or a closed hand) presses, vertical movement drags, release returns the cursor
-                    if grab.mode != "off" and (cursor.enabled or grab.at is not None):   # no grabs while hands are off
+                    if grab.mode != "off" and (cursor.enabled or grab.at is not None) and not wheel_held:   # no grabs while hands are off
                         if held_down and cursor.enabled:
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
                             if vhold is not None:
@@ -2993,12 +3208,14 @@ def main():
                         print(f"P,{t_det - t0:.2f},up,{dist:.3f},{pos[0]:.0f},{pos[1]:.0f}", file=sys.stderr, flush=True)
                         if args.click:
                             cursor.release(*pos)
-                    elif not grab.active:
+                    elif not grab.active and not wheel_held:        # the mouse stays at the anchor while the wheel is held
                         cursor.move(min(max(pos[0], 0.0), sw - 1), min(max(pos[1], 0.0), sh - 1))
                     t_ov = time.perf_counter()
                     slow.append(("track", t_ov - t_det))
                     overlay.update(pos, lock.frame if lock.at is not None else target, locked=lock.at is not None,
                                    grabbing=grab.active, visible=cursor.enabled, nudging=nudge.on)
+                    if wheel is not None:
+                        overlay.wheel_update(wheel.angle, wheel.spinning, cursor.enabled and wheel.enabled)
                     slow.append(("overlay", time.perf_counter() - t_ov))
             elif state == "held":
                 pos = last_pos  # nothing moves: cursor, filters, pinch and button keep their state
