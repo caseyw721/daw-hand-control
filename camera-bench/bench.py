@@ -2294,7 +2294,8 @@ def main():
     ap.add_argument("--no-cursor", action="store_true", help="measure only; do not move the cursor")
     ap.add_argument("--click", action="store_true",
                     help="make a pinch press and release the mouse button (default: pinch is a gesture only)")
-    ap.add_argument("--quiet", action="store_true", help="no sounds on pinch / calibration")
+    ap.add_argument("--quiet", action="store_true", help="(the default) no sounds on pinch / grip / trigger / calibration")
+    ap.add_argument("--sounds", action="store_true", help="system sounds on pinch / grip / trigger (off by default: user, 2026-10-01, 'get rid of the beep beep beep')")
     ap.add_argument("--preview", action="store_true")
     ap.add_argument("--marker", type=int, nargs="?", const=160, metavar="PX",
                     help="show a big black/white square (default 160 px) that follows the pointer, "
@@ -2331,7 +2332,7 @@ def main():
     from mediapipe.tasks.python import vision
 
     cursor = Cursor(enabled=not args.no_cursor)
-    sound = Sound(enabled=not args.quiet)
+    sound = Sound(enabled=args.sounds and not args.quiet)
     marker = Marker(size=args.marker or 160, enabled=bool(args.marker))
     overlay = Overlay(size=args.ring or 64, enabled=bool(args.ring))
     sw, sh = cursor.screen()
