@@ -3136,8 +3136,9 @@ def main():
                     # the scroll flywheel: a pinch held on the disc takes it, the wrist turns it, letting go spins it down
                     if wheel is not None:
                         on_screen = 0 <= pos[0] < sw and 0 <= pos[1] < sh
-                        if cursor.enabled and not wheel.active and not grab.active and on_screen and not wheel.contains(pos):
-                            wheel.anchor = pos                     # where the scrolling goes: the cursor's last place in the DAW
+                        if cursor.enabled and not wheel.active and not grab.active and on_screen and not wheel.contains(pos, zone=wheel.size):
+                            wheel.anchor = pos                     # where the scrolling goes: the cursor's last place in the DAW,
+                                                                   # well clear of the wheel (the hand passes its edge on the way in)
                         notches = 0
                         if held_down and cursor.enabled and not grab.active and wheel.contains(pos):
                             wheel.grab(t_det, nonlocal_state.get("roll"))
