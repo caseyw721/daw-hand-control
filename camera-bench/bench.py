@@ -2024,6 +2024,7 @@ WHEEL_LINES = 3              # scroll lines per notch (Logic's timeline: ~72 lin
 WHEEL_TAU = 0.9              # flywheel mode: after letting go the wheel spins down with this e-folding time (s)
 WHEEL_STOP_DPS = 25.0        # and stops below this speed (deg/s)
 WHEEL_MIN_TICK_S = 0.03      # clicks no closer than this
+WHEEL_QUIET_S = 0.7          # scroll commands (flicks) ignored this long after the wheel is let go
 BENDER_DEAD_DEG = 4.0        # spring mode: twist within this of centre does nothing
 BENDER_MAX_DEG = 80.0        # full deflection
 BENDER_MAX_LPS = 90.0        # scroll lines per second at full deflection (a quadratic curve: small twists crawl)
@@ -2061,6 +2062,7 @@ class Wheel:
         self.last_tick = 0.0
         self.turned = 0.0                # degrees in this grab (for the log)
         self.scrolled = 0                # lines in this grab (for the log)
+        self.released_at = -1e9          # the hand leaving the wheel looks like a flick: scroll commands are ignored for a moment
         self.sound = self._click()
 
     def contains(self, pos, zone=24.0):
@@ -2104,6 +2106,7 @@ class Wheel:
 
     def release(self, t):
         self.active, self.r_prev, self.t_prev = False, None, t
+        self.released_at = t
         if self.mode == "fly":
             if abs(self.v) < WHEEL_STOP_DPS:
                 self.v = 0.0
@@ -2760,6 +2763,8 @@ def main():
                     elif parts[:1] == ["scroll"] and len(parts) == 3:
                         if not cursor.enabled:
                             raise ValueError("hands off")
+                        if wheel is not None and (wheel.active or time.monotonic() - wheel.released_at < WHEEL_QUIET_S):
+                            raise ValueError("the wheel has the scroll (a flick as the hand leaves it)")
                         cursor.scroll(float(parts[1]), float(parts[2]))
                         print(f"I,scroll,{parts[1]},{parts[2]}", file=sys.stderr, flush=True)
                     elif parts[:1] == ["editor"] and len(parts) == 2 and parts[1] in ("hide", "show"):
