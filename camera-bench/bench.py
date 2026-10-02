@@ -1993,6 +1993,14 @@ class Grab:
                 self.active, self.h0, self.dx, self.dy, self.r0 = True, (hx, hy), 0.0, 0.0, roll
                 return ("press", self.at[0], self.at[1])
             return None
+        if t - self.t0 < TAP_S:
+            # a quick pinch is a click: the mouse is down but does not move until the pinch has been held TAP_S, so
+            # the jitter before a short pinch opens again never becomes a drag (live 2026-10-01: a dozen 5-17 px
+            # "drags" rubber-banded regions in the Tracks area; user: "it's letting me draw and select everything")
+            self.h0 = (hx, hy)
+            if roll is not None:
+                self.r0 = roll
+            return None
         dx, dy = (hx - self.h0[0]) * self.gain, (hy - self.h0[1]) * self.gain
         if roll is not None and self.r0 is not None:
             turn = roll - self.r0
