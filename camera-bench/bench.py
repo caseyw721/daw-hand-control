@@ -100,6 +100,56 @@ def lead_gain(speed, v0=150.0, v1=500.0):
     return min(max((speed - v0) / (v1 - v0), 0.0), 1.0)
 
 
+class Fuse:
+    """--fuse: the IMU ring (its receiver is a USB mouse) moves the cursor, fast and fine; the camera only pulls the
+    cursor toward its own target when the two disagree by more than `band` px, so the ring's drift cannot build up
+    and big jumps across the screen still come from the camera. The camera's target is compared with where the
+    cursor was `lag` s earlier, because the camera is that late: 135 ms behind the ring, measured 2026-10-07 with the
+    Osmo Action 4 by cross-correlating the ring's angular speed with the finger's. Beyond `far` px the pull is
+    stronger (the ring has slipped a long way, or the user pointed somewhere new)."""
+
+    def __init__(self, lag=0.135, band=60.0, gain=0.08, far=300.0, far_gain=0.35):
+        self.lag, self.band, self.gain, self.far, self.far_gain = lag, band, gain, far, far_gain
+        self.hist = collections.deque(maxlen=90)   # (t, x, y) of the cursor, one per camera frame
+
+    def step(self, target, t, cursor):
+        here = cursor.where()
+        self.hist.append((t, here[0], here[1]))
+        then = next((h for h in reversed(self.hist) if h[0] <= t - self.lag), self.hist[0])
+        ex, ey = target[0] - then[1], target[1] - then[2]
+        e = math.hypot(ex, ey)
+        if e <= self.band:
+            return
+        s = (self.far_gain if e > self.far else self.gain) * (e - self.band) / e   # pull only what is past the band
+        cursor.move(here[0] + ex * s, here[1] + ey * s)
+
+    def before(self, t, back):
+        """Where the cursor was `back` s before t. The ring sits on the pinching finger, so a pinch drags the cursor
+        off its target before the camera (135 ms late) even reports it; the click goes where the aim was before."""
+        for h in reversed(self.hist):
+            if h[0] <= t - back:
+                return (h[1], h[2])
+        return (self.hist[0][1], self.hist[0][2]) if self.hist else None
+
+
+def zoom_box(shape, centre, zoom):
+    """(x0, y0, x1, y1) pixels of a 1/zoom-size crop of the frame around centre (normalised), kept inside it."""
+    h, w = shape[:2]
+    bw, bh = int(w / zoom), int(h / zoom)
+    x0 = min(max(int(centre[0] * w - bw / 2), 0), w - bw)
+    y0 = min(max(int(centre[1] * h - bh / 2), 0), h - bh)
+    return x0, y0, x0 + bw, y0 + bh
+
+
+def unzoom(res, box, shape):
+    """Hand landmarks found in a zoom_box crop, mapped back to normalised full-frame coordinates (z scales with x)."""
+    h, w = shape[:2]
+    sx, sy = (box[2] - box[0]) / w, (box[3] - box[1]) / h
+    for hand in res.hand_landmarks:
+        for p in hand:
+            p.x, p.y, p.z = box[0] / w + p.x * sx, box[1] / h + p.y * sy, p.z * sx
+
+
 def gray_prep(bgr, clahe):
     """Greyscale plus a contrast lift (CLAHE) on a half-size frame, back to 3 channels for the model.
     Measured on a dim red-lit recording: the hand found in 95% of frames, against 93% raw and 88% for
@@ -1126,7 +1176,12 @@ class AimMap:
         if not face:
             self.eyes = None
             return
-        l, r = self.eyes = eye_centres(face)
+        self.see_eyes(*eye_centres(face), cam_w, cam_h, t)
+
+    def see_eyes(self, l, r, cam_w, cam_h, t):
+        """Two eye centres (normalised (x, y, z)): from the face landmarks, or from the body pose when the face is
+        too small for the face model (the Osmo on the TV, the user on the couch: face landmarker 0%, pose 100%)."""
+        self.eyes = (l, r)
         ipd = math.sqrt(((l[0] - r[0]) * cam_w) ** 2 + ((l[1] - r[1]) * cam_h) ** 2 + ((l[2] - r[2]) * cam_w) ** 2)
         p = l if self.eye == "right" else r if self.eye == "left" else ((l[0] + r[0]) / 2, (l[1] + r[1]) / 2)
         u, v = p[0] * cam_w, p[1] * cam_h
@@ -1134,8 +1189,10 @@ class AimMap:
         if stale or self.eye_px is None:
             self.eye_px, self.ipd = (u, v), ipd
         else:
-            self.eye_px = (self.eye_px[0] + 0.3 * (u - self.eye_px[0]), self.eye_px[1] + 0.3 * (v - self.eye_px[1]))
-            self.ipd += 0.08 * (ipd - self.ipd)
+            # eyes from the body pose (z 0) are a few px off at a time and only 10 per s: smooth them 6x harder
+            ke, ki = (0.05, 0.015) if l[2] == 0.0 and r[2] == 0.0 else (0.3, 0.08)
+            self.eye_px = (self.eye_px[0] + ke * (u - self.eye_px[0]), self.eye_px[1] + ke * (v - self.eye_px[1]))
+            self.ipd += ki * (ipd - self.ipd)
         self.face_t = t
 
     def eye_point(self, cam_w, cam_h):
@@ -2532,6 +2589,9 @@ def main():
     ap.add_argument("--aim-calibrate", action="store_true",
                     help="aim: start with the five-dot calibration (point at each dot until its disc fills); saved for "
                          "next time. The control line `calibrate` starts it later")
+    ap.add_argument("--aim-spread", type=float, default=0.04,
+                    help="aim calibration: how still (m on the screen plane) the aim must hold on a dot; 0.04 suits a "
+                         "laptop at arm's length, the jitter grows with distance (0.15 from a couch)")
     ap.add_argument("--aim-depth", type=float, default=0.12,
                     help="aim: per-frame smoothing of the hand's distance (0.12; 0.02 is slower and steadier)")
     ap.add_argument("--aim-through", choices=["base", "pip", "tip"], default="tip",
@@ -2579,7 +2639,9 @@ def main():
                     help="the scroll flywheel in the top-right corner, this big (0 = none); needs --ring for the overlay")
     ap.add_argument("--ring", type=int, default=0, metavar="PX",
                     help="draw a round cursor of this diameter and light up the control under it (0 = off)")
-    ap.add_argument("--camera", type=int, default=0)
+    ap.add_argument("--camera", default="auto",
+                    help="index, part of a camera's name (e.g. osmo), or auto: a plugged-in USB camera if there is one, "
+                         "else the Mac's default camera")
     ap.add_argument("--width", type=int, default=1280)
     ap.add_argument("--height", type=int, default=720)
     ap.add_argument("--fps", type=int, default=30,
@@ -2630,6 +2692,17 @@ def main():
                     help="send every frame's pointer pipeline (image anchor, hand in cm, distance, each filter stage, "
                          "lock, grab) as UDP JSON to 127.0.0.1:PORT, for the live diagnostic page (trace/diag.html)")
     ap.add_argument("--hands", type=int, default=1, help="hands to track (2 for two-hand gestures; costs detect time)")
+    ap.add_argument("--pose-eyes", action="store_true",
+                    help="aim mode: when the face model finds no face (too far), take the eyes from the body pose")
+    ap.add_argument("--fuse", action="store_true",
+                    help="the IMU ring moves the cursor (its receiver is a mouse); the camera only pulls it back when "
+                         "they disagree by more than --fuse-band px. Clicks and grabs then use the real cursor")
+    ap.add_argument("--fuse-lag", type=float, default=0.135, help="--fuse: how late the camera is behind the ring, s")
+    ap.add_argument("--fuse-band", type=float, default=60.0, help="--fuse: disagreement left to the ring, px")
+    ap.add_argument("--zoom", type=float, default=1.0,
+                    help="look for the hand in a crop this many times smaller than the frame, centred on the body under "
+                         "the face (aim mode), for a camera that is far or wide (the Osmo from the couch: hand in 1%% of "
+                         "frames at 1x); landmarks are mapped back to the full frame. Use with --width 1920 --height 1080")
     ap.add_argument("--enhance", action="store_true", help="same as --prep enhance")
     ap.add_argument("--prep", choices=list(PREPS), default="none",
                     help="before detection: none; enhance (grey-world colour + CLAHE); gray (greyscale + CLAHE, "
@@ -2650,6 +2723,8 @@ def main():
 
     import cv2
     import mediapipe as mp
+
+    import avcam
     from mediapipe.tasks import python as mpt
     from mediapipe.tasks.python import vision
 
@@ -2900,11 +2975,23 @@ def main():
     facer = None                  # aim mode: the face landmarker, made the first time it is needed
     aimcal = dots = None          # aim mode: the five-dot calibration and its dot while it runs
     face_ms, face_seen, face_frames, aim_report = [], 0, 0, 0.0
+    zoom_c = [0.5, 0.55]          # --zoom: where the hand is looked for (normalised), steered by the face in aim mode
+    fuse = Fuse(args.fuse_lag, args.fuse_band) if args.fuse else None
+    poser = None                  # --pose-eyes: MediaPipe Pose, made the first time the face is missed
     if args.aim_calibrate:
         nonlocal_state["calibrate"] = True
 
     def open_camera():
-        c = cv2.VideoCapture(args.camera, cv2.CAP_AVFOUNDATION)
+        if not args.camera.isdigit():     # by name: OpenCV's index order changes between opens (avcam.py)
+            dev = avcam.find(args.camera)
+            if dev is None:
+                print(f"I,camera,none matching {args.camera},have,{'|'.join(avcam.names())}", file=sys.stderr, flush=True)
+                return cv2.VideoCapture()     # not opened: reads fail and the reopen looks again
+            c = avcam.AVCamera(dev, args.width, args.height)
+            c.set(cv2.CAP_PROP_FPS, args.fps)
+            print(f"I,camera,using,{c.name}", file=sys.stderr, flush=True)
+            return c
+        c = cv2.VideoCapture(int(args.camera), cv2.CAP_AVFOUNDATION)
         c.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         c.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         c.set(cv2.CAP_PROP_FPS, args.fps)  # (CAP_PROP_BUFFERSIZE is not supported by the AVFoundation backend)
@@ -2913,7 +3000,7 @@ def main():
     cap = open_camera()
     read_fails = 0                # consecutive failed reads; the camera is reopened after READ_FAILS_REOPEN
     if not cap.isOpened():
-        sys.exit("camera %d did not open (Camera permission for this terminal?)" % args.camera)
+        sys.exit("camera %s did not open (Camera permission for this terminal?)" % args.camera)
     cw, ch, cfps = cap.get(3), cap.get(4), cap.get(5)
     # OpenCV's rate read-back right after opening is unreliable (15 on one run, 30 on the next, both
     # delivering 30), so it is only labelled; the measured rate is what the S line and the warning use.
@@ -2969,7 +3056,7 @@ def main():
                 if nonlocal_state.pop("calibrate", None):
                     want = "aim"
                     if aimcal is None:
-                        aimcal = AimCalibration(sw, sh)
+                        aimcal = AimCalibration(sw, sh, spread=args.aim_spread)
                         dots = dots or AimDots()
                         lock.reset()
                         r = grab.end()
@@ -3047,9 +3134,12 @@ def main():
                 frame = enhance(frame, clahe)
             elif args.prep == "gray":
                 frame = gray_prep(frame, clahe)
-            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            box = zoom_box(frame.shape, zoom_c, args.zoom) if args.zoom > 1 else None
+            rgb = cv2.cvtColor(frame if box is None else frame[box[1]:box[3], box[0]:box[2]], cv2.COLOR_BGR2RGB)
             img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             res = landmarker.detect_for_video(img, int((t_frame - t0) * 1000))
+            if box is not None:
+                unzoom(res, box, frame.shape)
             t_det = time.perf_counter()
             slow.append(("detect", t_det - t_frame))
             det_ms.append((t_det - t_frame) * 1000)
@@ -3204,11 +3294,15 @@ def main():
                         pass
                     pos = lock.update(pos, t_det, math.hypot(fx.dx, fy.dx), held=held,
                                       grab_at=click_at if held_down else None, target=target)
+                    if fuse is not None and cursor.enabled:
+                        fuse.step(pos, t_det, cursor)    # the camera only pulls the ring-driven cursor
+                        pos = cursor.where()             # clicks, grabs and the overlay use the real cursor
                     if probe and not grab.active:
                         probe.pos = pos
                     marker.move(*pos)
                     # the scroll flywheel: a pinch held on the disc takes it, the wrist turns it, letting go spins it down
-                    if wheel is not None:
+                    # (not with --fuse: the ring owns the cursor, the camera only clicks)
+                    if wheel is not None and fuse is None:
                         on_screen = 0 <= pos[0] < sw and 0 <= pos[1] < sh
                         if cursor.enabled and not wheel.active and not grab.active and on_screen and not wheel.contains(pos, zone=wheel.size):
                             wheel.anchor = pos                     # where the scrolling goes: the cursor's last place in the DAW,
@@ -3236,7 +3330,7 @@ def main():
                             tap["grabbed"] = True                  # a pinch on the wheel never clicks
                     wheel_held = wheel is not None and wheel.active
                     # the grab session: pinch-and-hold (or a closed hand) presses, vertical movement drags, release returns the cursor
-                    if grab.mode != "off" and (cursor.enabled or grab.at is not None) and not wheel_held:   # no grabs while hands are off
+                    if fuse is None and grab.mode != "off" and (cursor.enabled or grab.at is not None) and not wheel_held:   # no grabs while hands are off; none with --fuse (they drag with the camera's motion)
                         if held_down and cursor.enabled:
                             role = probe.found[1] if (probe and probe.found and target is not None) else None
                             if vhold is not None:
@@ -3284,6 +3378,8 @@ def main():
                         tap = None
                     if event == "down":
                         click_at = pos
+                        if fuse is not None:              # --fuse: click where the ring pointed before the pinch moved it
+                            click_at = fuse.before(t_det, fuse.lag + 0.15) or pos
                         if not thumb_mode:            # a pinch starts a tap: quick = click, held = grab (tap on)
                             tap = {"t": t_det, "grabbed": False, "at": click_at}
                         print(f"P,{t_det - t0:.2f},down,{dist:.3f},{click_at[0]:.0f},{click_at[1]:.0f}", file=sys.stderr, flush=True)
@@ -3295,7 +3391,7 @@ def main():
                         print(f"P,{t_det - t0:.2f},up,{dist:.3f},{pos[0]:.0f},{pos[1]:.0f}", file=sys.stderr, flush=True)
                         if args.click:
                             cursor.release(*pos)
-                    elif not grab.active and not wheel_held:        # the mouse stays at the anchor while the wheel is held
+                    elif fuse is None and not grab.active and not wheel_held:   # the mouse stays at the anchor while the wheel is held
                         cursor.move(min(max(pos[0], 0.0), sw - 1), min(max(pos[1], 0.0), sh - 1))
                     t_ov = time.perf_counter()
                     slow.append(("track", t_ov - t_det))
@@ -3497,15 +3593,35 @@ def main():
                 # the camera's own full-size colour image, not the hand's prepared one: the grey prep is half size, and at
                 # 6 ft the eyes were ~20 px apart in it (user, live: "use color ... too dark of an area to register eyes
                 # from more than like six feet away")
-                fimg = img if args.face_prep == "hand" else mp.Image(
+                fimg = img if (args.face_prep == "hand" and box is None) else mp.Image(
                     image_format=mp.ImageFormat.SRGB, data=cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB))
                 fres = facer.detect_for_video(fimg, int((t_frame - t0) * 1000))
                 face_ms.append((time.perf_counter() - t_fc) * 1000)
                 slow.append(("face", face_ms[-1] / 1000))
                 face = [(p.x, p.y, p.z) for p in fres.face_landmarks[0]] if fres.face_landmarks else None
+                body_eyes = None
+                if face is None and args.pose_eyes and frames % 3 == 0:   # far away: the body pose still finds the eyes
+                    if poser is None:
+                        poser = mp.solutions.pose.Pose(model_complexity=1, min_detection_confidence=0.5,
+                                                       min_tracking_confidence=0.5)
+                    pres = poser.process(cv2.cvtColor(camera_frame, cv2.COLOR_BGR2RGB))
+                    if pres.pose_landmarks:
+                        L, P = pres.pose_landmarks.landmark, mp.solutions.pose.PoseLandmark
+                        le, re_ = L[P.LEFT_EYE], L[P.RIGHT_EYE]
+                        if le.visibility > 0.5 and re_.visibility > 0.5:
+                            body_eyes = ((le.x, le.y, 0.0), (re_.x, re_.y, 0.0))
+                if face and box is not None and not hand:   # re-aim the crop only while searching: tracking runs in crop coordinates
+                    fy0, fy1 = min(p[1] for p in face), max(p[1] for p in face)
+                    want = (sum(p[0] for p in face) / len(face), (fy0 + fy1) / 2 + 1.5 * (fy1 - fy0))
+                    zoom_c[0] += 0.2 * (want[0] - zoom_c[0]); zoom_c[1] += 0.2 * (want[1] - zoom_c[1])
                 mapper.see_face(face, cw, ch, t_det)
+                if body_eyes:
+                    mapper.see_eyes(*body_eyes, cw, ch, t_det)
+                    if box is not None and not hand:   # steer the hand crop to the chest under the eyes
+                        ex, ey = (body_eyes[0][0] + body_eyes[1][0]) / 2, body_eyes[0][1]
+                        zoom_c[0] += 0.2 * (ex - zoom_c[0]); zoom_c[1] += 0.2 * (ey + 0.15 - zoom_c[1])
                 face_frames += 1
-                face_seen += face is not None
+                face_seen += face is not None or body_eyes is not None
                 if t_det - aim_report >= 5.0:
                     if aim_report:
                         E, F = mapper.E, mapper.F

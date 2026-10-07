@@ -89,10 +89,20 @@ out.setSampleBufferDelegate(d, queue: DispatchQueue(label: "cam"))
 session.addOutput(out)
 session.commitConfiguration()
 session.startRunning()
-try! dev.lockForConfiguration()
-dev.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)  // max first: min may not exceed it
-dev.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
-dev.unlockForConfiguration()
+// Pin only when the active format allows 1/30 s: an external camera that doesn't (the DJI
+// Osmo Action 4 webcam) throws an Objective-C exception from the setter, which ends the probe.
+let want = CMTime(value: 1, timescale: 30)
+if dev.activeFormat.videoSupportedFrameRateRanges.contains(where: {
+    CMTimeCompare($0.minFrameDuration, want) <= 0 && CMTimeCompare(want, $0.maxFrameDuration) <= 0
+}) {
+    try! dev.lockForConfiguration()
+    dev.activeVideoMaxFrameDuration = want  // max first: min may not exceed it
+    dev.activeVideoMinFrameDuration = want
+    dev.unlockForConfiguration()
+} else {
+    print("frame duration not pinned: the active format allows " + dev.activeFormat.videoSupportedFrameRateRanges.map {
+        String(format: "%.3f-%.3f fps", $0.minFrameRate, $0.maxFrameRate) }.joined(separator: ", "))
+}
 RunLoop.main.run(until: Date(timeIntervalSinceNow: seconds))
 session.stopRunning()
 
